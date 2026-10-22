@@ -70,54 +70,182 @@ def password_digest(password, salt):
     return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 310000).hex()
 
 
-def require_access(root):
-    """A local application lock, not database encryption."""
+def auth_record():
     if not AUTH.exists():
-        messagebox.showinfo('First-time security setup', 'Set a password (at least 8 characters). Keep it safe: there is no password recovery.', parent=root)
-        for _ in range(3):
-            pw = simpledialog.askstring('Create password', 'New application password:', show='*', parent=root)
-            if pw is None: return False
-            if len(pw) < 8:
-                messagebox.showwarning('Password', 'Use at least 8 characters.', parent=root)
-                continue
-            confirm = simpledialog.askstring('Confirm password', 'Repeat password:', show='*', parent=root)
-            if confirm != pw:
-                messagebox.showwarning('Password', 'Passwords do not match.', parent=root)
-                continue
-            salt = secrets.token_hex(16)
-            AUTH.write_text(json.dumps({'salt':salt,'digest':password_digest(pw,salt)}),encoding='utf-8')
-            return True
-        return False
-    try:
-        record=json.loads(AUTH.read_text(encoding='utf-8'))
-        for _ in range(3):
-            pw=simpledialog.askstring('Unlock Layaq', 'Enter your app password:', show='*', parent=root)
-            if pw is None: return False
-            if hmac.compare_digest(password_digest(pw,record['salt']),record['digest']): return True
-            messagebox.showerror('Access denied','Incorrect password.',parent=root)
-    except (ValueError,KeyError,OSError) as exc:
-        messagebox.showerror('Security error',f'Cannot read local authentication settings: {exc}',parent=root)
-    return False
+        return None
+    return json.loads(AUTH.read_text(encoding='utf-8'))
+
+
+def check_secret(secret, record, prefix):
+    salt, digest = record.get(prefix + '_salt'), record.get(prefix + '_digest')
+    return bool(salt and digest and hmac.compare_digest(password_digest(secret, salt), digest))
+
+
+def write_auth(record):
+    tmp = AUTH.with_suffix('.tmp')
+    tmp.write_text(json.dumps(record, indent=2), encoding='utf-8')
+    os.replace(tmp, AUTH)
+
+
+def set_secret(record, secret, prefix):
+    salt = secrets.token_hex(16)
+    record[prefix + '_salt'] = salt
+    record[prefix + '_digest'] = password_digest(secret, salt)
+
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.withdraw()
-        if not require_access(self):
-            self.destroy()
-            return
-        self.deiconify()
-        setup()
         self.title(APP_NAME)
         self.geometry('1380x840')
-        self.minsize(1060, 660)
+        self.minsize(900, 620)
         self.configure(bg=BG)
+        self._style()
+        self._toast_job = None
+        self._toast_frame = None
+        self._pulse_job = None
+        self._show_access_screen()
+
+    def _show_access_screen(self):
+        self.auth_frame = tk.Frame(self, bg=BG)
+        self.auth_frame.pack(fill='both', expand=True)
+        pane = tk.Frame(self.auth_frame, bg=PANEL, padx=30, pady=26)
+        pane.place(relx=.5, rely=.5, anchor='center')
+        tk.Label(pane, text='LAYAQ  /  TRADING JOURNAL', bg=PANEL, fg=TEXT,
+                 font=('Segoe UI Semibold', 19)).pack(pady=(0, 12))
+        self.login_feedback = tk.StringVar(value='')
+        self.login_password = tk.StringVar()
+        self.login_confirm = tk.StringVar()
+        self.login_master = tk.StringVar()
+        try:
+            record = auth_record()
+        except (OSError, ValueError) as exc:
+            tk.Label(pane,text=f'Cannot read security file: {exc}',fg=RED,bg=PANEL).pack()
+            return
+        if record is None:
+            tk.Label(pane,text='FIRST-TIME SECURITY SETUP',fg=ACCENT,bg=PANEL).pack(pady=6)
+            tk.Label(pane,text='Choose your login password (at least 8 characters).',fg=TEXT,bg=PANEL).pack()
+            self._secret_entry(pane, 'Password', self.login_password)
+            self._secret_entry(pane, 'Confirm password', self.login_confirm)
+            ttk.Button(pane,text='Create security keys',style='Accent.TButton',command=self._create_credentials).pack(fill='x',pady=(12,4))
+        elif not record.get('enabled',True):
+            self.auth_frame.destroy()
+            self._open_main()
+            return
+        else:
+            tk.Label(pane,text='Unlock using your password or master key',fg=MUTED,bg=PANEL).pack(pady=6)
+            self._secret_entry(pane, 'Password / Master key', self.login_password)
+            ttk.Button(pane,text='Unlock',style='Accent.TButton',command=self._unlock).pack(fill='x',pady=9)
+            self.bind('<Return>',lambda _e:self._unlock())
+        tk.Label(pane,textvariable=self.login_feedback,fg=RED,bg=PANEL,wraplength=390).pack(pady=6)
+
+    def _secret_entry(self,parent,label,variable):
+        tk.Label(parent,text=label,fg=TEXT,bg=PANEL).pack(anchor='w',pady=(7,2))
+        entry=ttk.Entry(parent,textvariable=variable,show='*',width=42)
+        entry.pack(fill='x')
+        return entry
+
+    def _create_credentials(self):
+        password=self.login_password.get()
+        if len(password)<8 or password!=self.login_confirm.get():
+            self.login_feedback.set('Password must have 8+ characters, and both entries must match.')
+            return
+        master=secrets.token_hex(16).upper()
+        record={'enabled': True}
+        set_secret(record,password,'password')
+        set_secret(record,master,'master')
+        try:write_auth(record)
+        except OSError as exc:
+            self.login_feedback.set(str(exc));return
+        self.auth_frame.destroy()
+        self._show_master_once(master)
+
+    def _show_master_once(self,master):
+        self.master_frame=tk.Frame(self,bg=BG)
+        self.master_frame.pack(fill='both',expand=True)
+        pane=tk.Frame(self.master_frame,bg=PANEL,padx=30,pady=30)
+        pane.place(relx=.5,rely=.5,anchor='center')
+        tk.Label(pane,text='SAVE YOUR MASTER RECOVERY KEY',bg=PANEL,fg=ACCENT,
+                 font=('Segoe UI Semibold',19)).pack(pady=8)
+        tk.Label(pane,text='This key can unlock the app and reset your forgotten password.\nIt is shown only once. Store it in a safe place OFF this PC.',
+                 bg=PANEL,fg=TEXT,justify='center').pack(pady=9)
+        e=ttk.Entry(pane,width=42,font=('Consolas',15))
+        e.insert(0,master);e.configure(state='readonly');e.pack(pady=12)
+        acknowledged=tk.BooleanVar(value=False)
+        ttk.Checkbutton(pane,text='I have safely copied my master key',variable=acknowledged).pack(pady=8)
+        def proceed():
+            if not acknowledged.get():
+                messagebox.showwarning('Master key','Save and acknowledge your recovery key before continuing.',parent=self)
+                return
+            self.master_frame.destroy();self._open_main()
+        ttk.Button(pane,text='Continue to journal',command=proceed,style='Accent.TButton').pack(pady=8)
+
+    def _unlock(self):
+        key=self.login_password.get()
+        try:record=auth_record()
+        except (OSError,ValueError) as exc:
+            self.login_feedback.set(str(exc));return
+        if record and (check_secret(key,record,'password') or check_secret(key,record,'master')):
+            self.unbind('<Return>')
+            self.auth_frame.destroy()
+            self._open_main()
+        else:
+            self.login_feedback.set('Incorrect password or recovery key.')
+            self.login_password.set('')
+
+    def _open_main(self):
+        setup()
         self.trade_id = None
         self.pending_images = {}
         self.active_preview = None
-        self._style()
         self._layout()
         self.refresh()
+
+    def _verify_admin(self):
+        key=simpledialog.askstring('Security verification','Enter your password or master recovery key:',show='*',parent=self)
+        if key is None:return False
+        try:rec=auth_record()
+        except (OSError,ValueError):rec=None
+        if rec and (check_secret(key,rec,'password') or check_secret(key,rec,'master')):return True
+        messagebox.showerror('Access denied','Incorrect password / recovery key.',parent=self)
+        return False
+
+    def _change_password(self):
+        if not self._verify_admin():return
+        pw=simpledialog.askstring('Change password','New password (at least 8 characters):',show='*',parent=self)
+        if pw is None:return
+        if len(pw)<8:
+            messagebox.showwarning('Invalid','Use at least 8 characters.',parent=self);return
+        again=simpledialog.askstring('Confirm','Repeat new password:',show='*',parent=self)
+        if again!=pw:
+            messagebox.showwarning('Mismatch','Passwords do not match.',parent=self);return
+        rec=auth_record()
+        set_secret(rec,pw,'password');write_auth(rec)
+        messagebox.showinfo('Updated','Login password changed. Your master key still works.',parent=self)
+
+    def _toggle_password(self):
+        if not self._verify_admin():return
+        rec=auth_record(); rec['enabled']=not rec.get('enabled',True);write_auth(rec)
+        self._refresh_security_label()
+        messagebox.showinfo('Login settings', 'Password prompt is now '+('ON' if rec['enabled'] else 'OFF')+'. Changes apply on next launch.',parent=self)
+
+    def _refresh_security_label(self):
+        rec=auth_record()
+        self.security_status.set('Login password: '+('ON' if rec.get('enabled',True) else 'OFF'))
+
+    def _make_settings(self):
+        box=tk.Frame(self.settings_tab,bg=PANEL,padx=24,pady=24)
+        box.pack(anchor='nw',fill='x',padx=25,pady=25)
+        ttk.Label(box,text='Security settings',font=('Segoe UI Semibold',19)).pack(anchor='w',pady=(0,10))
+        self.security_status=tk.StringVar()
+        ttk.Label(box,textvariable=self.security_status).pack(anchor='w',pady=8)
+        ttk.Button(box,text='Change login password',command=self._change_password).pack(anchor='w',pady=8)
+        ttk.Button(box,text='Turn login ON / OFF',command=self._toggle_password).pack(anchor='w',pady=8)
+        ttk.Label(box,text='To recover a forgotten password, use your master key at login, then change it here.\n'
+                        'Your master key is only shown at first setup. It is not stored in readable form.\n'
+                        'This is an application lock, not full database encryption.',
+                  style='Muted.TLabel').pack(anchor='w',pady=15)
+        self._refresh_security_label()
 
     def _style(self):
         s = ttk.Style(self)
@@ -145,20 +273,83 @@ class App(tk.Tk):
         header.pack(fill='x', padx=22, pady=(16, 6))
         tk.Label(header, text='LAYAQ  /  TRADING JOURNAL', font=('Segoe UI Semibold', 23), bg=BG, fg=TEXT).pack(side='left')
         tk.Label(header, text='SUPER APP   •   OFFLINE', font=('Segoe UI', 10), bg=BG, fg=GREEN).pack(side='left', padx=18)
+        ttk.Button(header, text='Save Trade', style='Accent.TButton', command=self.save_trade).pack(side='right', padx=4)
+        ttk.Button(header, text='+ New Trade', style='Accent.TButton', command=self.new_trade).pack(side='right', padx=4)
         ttk.Button(header, text='Backup', command=self.backup).pack(side='right', padx=4)
         ttk.Button(header, text='Restore', command=self.restore).pack(side='right', padx=4)
         ttk.Button(header, text='Export CSV', command=self.export_csv).pack(side='right', padx=4)
+        self.activity_line = tk.Canvas(self, height=3, bg=BG, highlightthickness=0)
+        self.activity_line.pack(fill='x', padx=22)
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill='both', expand=True, padx=20, pady=10)
         self.dashboard = ttk.Frame(self.tabs)
         self.history = ttk.Frame(self.tabs)
         self.editor = ttk.Frame(self.tabs)
+        self.settings_tab = ttk.Frame(self.tabs)
         self.tabs.add(self.dashboard, text='Dashboard')
         self.tabs.add(self.history, text='Trade History')
         self.tabs.add(self.editor, text='Trade Editor & Charts')
+        self.tabs.add(self.settings_tab, text='Settings')
         self._make_dashboard()
         self._make_history()
         self._make_editor()
+        self._make_settings()
+
+    def notify(self, message, kind='success', duration=3400):
+        """Non-modal notification inside the application; never opens a second window."""
+        if self._toast_job is not None:
+            self.after_cancel(self._toast_job)
+            self._toast_job = None
+        if self._toast_frame is not None:
+            self._toast_frame.destroy()
+        color = GREEN if kind == 'success' else (RED if kind == 'error' else ACCENT)
+        frame = tk.Frame(self, bg=PANEL, highlightbackground=color, highlightthickness=1)
+        self._toast_frame = frame
+        symbol = '✓' if kind == 'success' else ('!' if kind == 'error' else 'i')
+        tk.Label(frame, text=symbol, bg=PANEL, fg=color,
+                 font=('Segoe UI Semibold', 17)).pack(side='left', padx=(15, 8), pady=10)
+        tk.Label(frame, text=message, bg=PANEL, fg=TEXT,
+                 font=('Segoe UI', 11), wraplength=480, justify='left').pack(side='left', padx=(0, 20), pady=12)
+        ttk.Button(frame, text='×', command=self._hide_notification).pack(side='right', padx=8)
+        frame.place(relx=.5, rely=0, y=-90, anchor='n')
+        # A short, discreet downward slide adds motion without distracting animations.
+        def slide(step=0):
+            if self._toast_frame is not frame or not frame.winfo_exists():
+                return
+            target = 18
+            y = round(-90 + (target + 90) * (1 - (1 - step/12)**3))
+            frame.place_configure(y=y)
+            if step < 12:
+                self.after(16, lambda: slide(step + 1))
+        slide()
+        self._toast_job = self.after(duration, self._hide_notification)
+        self._animate_activity(color)
+
+    def _hide_notification(self):
+        self._toast_job = None
+        if self._toast_frame is not None:
+            self._toast_frame.destroy()
+            self._toast_frame = None
+
+    def _animate_activity(self, color):
+        """Short moving accent marker along the header after an action."""
+        if not hasattr(self, 'activity_line') or not self.activity_line.winfo_exists():
+            return
+        if self._pulse_job is not None:
+            self.after_cancel(self._pulse_job)
+        canvas = self.activity_line
+        canvas.delete('all')
+        def tick(i=0):
+            if not canvas.winfo_exists():
+                return
+            width = max(1, canvas.winfo_width())
+            canvas.delete('all')
+            if i >= 28:
+                return
+            x = max(0, (i / 28) * (width + 120) - 120)
+            canvas.create_rectangle(x, 0, min(width, x + 120), 3, fill=color, outline='')
+            self._pulse_job = self.after(18, lambda: tick(i+1))
+        tick()
 
     def _make_dashboard(self):
         self.stats_frame = ttk.Frame(self.dashboard)
@@ -426,7 +617,11 @@ class App(tk.Tk):
         right = ttk.Frame(wrap)
         right.pack(side='left', fill='both', expand=True, pady=5)
         self.editor_title = ttk.Label(left, text='New Trade', font=('Segoe UI Semibold', 18))
-        self.editor_title.pack(anchor='w', pady=(0, 12))
+        self.editor_title.pack(anchor='w', pady=(0, 8))
+        fixed_actions=ttk.Frame(left)
+        fixed_actions.pack(fill='x',pady=(0,8))
+        ttk.Button(fixed_actions,text='Save Trade',style='Accent.TButton',command=self.save_trade).pack(side='left',padx=3)
+        ttk.Button(fixed_actions,text='+ New Trade',command=self.new_trade).pack(side='left',padx=3)
         form = ttk.Frame(left)
         form.pack(fill='x')
         self.fields = {}
@@ -454,10 +649,6 @@ class App(tk.Tk):
         ttk.Label(left, text='Post-trade review / lessons').pack(anchor='w', pady=(9, 3))
         self.review_note = tk.Text(left, height=3, bg=ENTRY, fg=TEXT, insertbackground=TEXT, wrap='word', relief='flat')
         self.review_note.pack(fill='x')
-        actions = ttk.Frame(left)
-        actions.pack(fill='x', pady=14)
-        ttk.Button(actions, text='Save Trade', style='Accent.TButton', command=self.save_trade).pack(side='left', padx=3)
-        ttk.Button(actions, text='Clear / New', command=self.new_trade).pack(side='left', padx=3)
         ttk.Label(right, text='CHART EVIDENCE  •  BEFORE / AFTER', font=('Segoe UI Semibold', 17)).pack(anchor='w', pady=(0, 6))
         ttk.Label(right, text='Six chart slots per trade. Choose an image or paste a screenshot from the clipboard.', style='Muted.TLabel').pack(anchor='w', pady=(0, 12))
         grid = ttk.Frame(right)
@@ -562,12 +753,12 @@ class App(tk.Tk):
 
     def save_trade(self):
         values={k:v.get().strip() for k,v in self.fields.items()}
-        if not values['symbol']:return messagebox.showwarning('Required','Enter a symbol.')
+        if not values['symbol']:return self.notify('Enter a symbol before saving.', 'error')
         try:dt.datetime.strptime(values['date'],'%Y-%m-%d %H:%M')
-        except ValueError:return messagebox.showwarning('Invalid date','Use YYYY-MM-DD HH:MM.')
+        except ValueError:return self.notify('Date must use YYYY-MM-DD HH:MM.', 'error')
         for k in ('entry','exit','stop','target','size','risk','fees','pnl','pnl_high','pnl_low'):
             try:values[k]=float(values[k]) if values[k] else None
-            except ValueError:return messagebox.showwarning('Invalid number',f'{k} must be a number.')
+            except ValueError:return self.notify(f'{k} must be a number.', 'error')
         values['setup']=self.setup_note.get('1.0','end').strip()
         values['review']=self.review_note.get('1.0','end').strip()
         keys=COLUMNS
@@ -600,7 +791,7 @@ class App(tk.Tk):
                 except OSError:pass
         self.load_trade(tid)
         self.refresh()
-        messagebox.showinfo('Saved',f'Trade #{tid} saved locally.')
+        self.notify(f'Trade #{tid} saved successfully  •  Stored locally')
 
     def delete_selected(self):
         sel=self.tree.selection()
@@ -673,7 +864,7 @@ class App(tk.Tk):
             writer=csv.writer(f)
             writer.writerow(['id']+COLUMNS)
             for row in self._all_trades():writer.writerow([row['id']]+[row[k] for k in COLUMNS])
-        messagebox.showinfo('Exported',f'CSV exported to:\n{out}')
+        self.notify(f'CSV exported successfully: {Path(out).name}')
 
     def backup(self):
         dest=filedialog.asksaveasfilename(defaultextension='.zip',initialfile=f'layaq_backup_{dt.date.today().isoformat()}.zip',filetypes=[('ZIP archive','*.zip')])
@@ -686,7 +877,7 @@ class App(tk.Tk):
                 for file in IMAGES.glob('*'):
                     if file.is_file():z.write(file,'images/'+file.name)
         finally:temp.unlink(missing_ok=True)
-        messagebox.showinfo('Backup completed','Database and screenshots were included in the backup archive.')
+        self.notify('Backup complete  •  Trades and screenshots included')
 
     def restore(self):
         archive=filedialog.askopenfilename(filetypes=[('ZIP archive','*.zip')])
@@ -735,7 +926,7 @@ class App(tk.Tk):
                 shutil.rmtree(IMAGES,ignore_errors=True);shutil.copytree(old_images,IMAGES)
                 raise
             self.new_trade();self.refresh()
-            messagebox.showinfo('Restore complete','Trades and screenshots have been restored. Login password was not changed.')
+            self.notify('Restore complete  •  Trades and screenshots recovered')
         except Exception as exc:
             messagebox.showerror('Restore failed',str(exc))
         finally:
