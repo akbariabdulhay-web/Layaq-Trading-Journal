@@ -245,7 +245,35 @@ class App(tk.Tk):
                         'Your master key is only shown at first setup. It is not stored in readable form.\n'
                         'This is an application lock, not full database encryption.',
                   style='Muted.TLabel').pack(anchor='w',pady=15)
+        ttk.Separator(box,orient='horizontal').pack(fill='x',pady=(16,12))
+        ttk.Label(box,text='Trade ID numbering',font=('Segoe UI Semibold',16)).pack(anchor='w',pady=(0,6))
+        ttk.Label(box,text='Reset the next Trade ID to 1 after all trades have been deleted.\nExisting trades and screenshots are never deleted by this action.',style='Muted.TLabel').pack(anchor='w',pady=(0,10))
+        ttk.Button(box,text='Reset Trade ID Counter',command=self.reset_trade_ids).pack(anchor='w',pady=6)
         self._refresh_security_label()
+
+    def reset_trade_ids(self):
+        # Reset only an empty journal: SQLite AUTOINCREMENT will otherwise use MAX(id)+1.
+        try:
+            with connect() as cn:
+                remaining=cn.execute('SELECT COUNT(*) FROM trades').fetchone()[0]
+                if remaining:
+                    return self.notify(f'Cannot reset IDs: {remaining} trade(s) still exist. Remove them first.', 'error', 6500)
+            if not messagebox.askyesno('Reset Trade IDs',
+                                      'Reset next Trade ID to 1?\n\nThis does not delete trades, images, or settings.\nThis works only while the journal is empty.',parent=self):
+                return
+            # Make a durable pre-change DB copy before modifying the sequence.
+            backup_path=BACKUPS / ('before_id_reset_' + dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.sqlite3')
+            with closing(sqlite3.connect(DB)) as source, closing(sqlite3.connect(backup_path)) as target:
+                source.backup(target)
+            with connect() as cn:
+                cn.execute('BEGIN IMMEDIATE')
+                if cn.execute('SELECT COUNT(*) FROM trades').fetchone()[0]:
+                    return self.notify('Journal is no longer empty; reset cancelled.', 'error')
+                cn.execute("DELETE FROM sqlite_sequence WHERE name='trades'")
+            self.refresh()
+            self.notify('Trade ID counter reset. Next new trade will be #1.')
+        except Exception as exc:
+            self.notify(f'ID reset failed: {exc}', 'error', 7500)
 
     def _style(self):
         s = ttk.Style(self)
@@ -611,18 +639,55 @@ class App(tk.Tk):
     def _make_editor(self):
         wrap = ttk.Frame(self.editor)
         wrap.pack(fill='both', expand=True)
-        left = ttk.Frame(wrap, width=420)
+        left = ttk.Frame(wrap, width=460)
         left.pack(side='left', fill='y', padx=(0, 15), pady=5)
         left.pack_propagate(False)
+        # The editor has a persistent action bar and its own independently
+        # scrollable form. Long notes are never clipped on smaller displays.
+        action_bar = ttk.Frame(left)
+        action_bar.pack(fill='x', pady=(0, 8))
+        self.editor_title = ttk.Label(action_bar, text='New Trade', font=('Segoe UI Semibold', 18))
+        self.editor_title.pack(anchor='w', pady=(0, 8))
+        fixed_actions = ttk.Frame(action_bar)
+        fixed_actions.pack(fill='x')
+        ttk.Button(fixed_actions, text='Save Trade', style='Accent.TButton', command=self.save_trade).pack(side='left', padx=3)
+        ttk.Button(fixed_actions, text='+ New Trade', command=self.new_trade).pack(side='left', padx=3)
+
+        scroll_container = ttk.Frame(left)
+        scroll_container.pack(fill='both', expand=True)
+        editor_canvas = tk.Canvas(scroll_container, bg=BG, highlightthickness=0,
+                                  borderwidth=0, takefocus=0)
+        editor_scrollbar = ttk.Scrollbar(scroll_container, orient='vertical', command=editor_canvas.yview)
+        editor_canvas.configure(yscrollcommand=editor_scrollbar.set)
+        editor_scrollbar.pack(side='right', fill='y')
+        editor_canvas.pack(side='left', fill='both', expand=True)
+        form_body = ttk.Frame(editor_canvas)
+        canvas_window = editor_canvas.create_window((0, 0), window=form_body, anchor='nw')
+        form_body.bind('<Configure>', lambda e: editor_canvas.configure(scrollregion=editor_canvas.bbox('all')))
+        editor_canvas.bind('<Configure>', lambda e: editor_canvas.itemconfigure(canvas_window, width=e.width))
+        self.editor_form_canvas = editor_canvas
+
+        def scroll_editor(event):
+            if event.num == 4: increment = -1
+            elif event.num == 5: increment = 1
+            else: increment = -int(event.delta / 120) if event.delta else 0
+            if increment:
+                editor_canvas.yview_scroll(increment, 'units')
+                return 'break'
+
+        # Bind only within editor-form widgets: dashboard, chart mouse wheel,
+        # and other tabs remain unaffected. Text fields scroll their own text.
+        def bind_editor_wheel(widget):
+            if not isinstance(widget, tk.Text):
+                widget.bind('<MouseWheel>', scroll_editor, add='+')
+                widget.bind('<Button-4>', scroll_editor, add='+')
+                widget.bind('<Button-5>', scroll_editor, add='+')
+            for child in widget.winfo_children():
+                bind_editor_wheel(child)
+
         right = ttk.Frame(wrap)
         right.pack(side='left', fill='both', expand=True, pady=5)
-        self.editor_title = ttk.Label(left, text='New Trade', font=('Segoe UI Semibold', 18))
-        self.editor_title.pack(anchor='w', pady=(0, 8))
-        fixed_actions=ttk.Frame(left)
-        fixed_actions.pack(fill='x',pady=(0,8))
-        ttk.Button(fixed_actions,text='Save Trade',style='Accent.TButton',command=self.save_trade).pack(side='left',padx=3)
-        ttk.Button(fixed_actions,text='+ New Trade',command=self.new_trade).pack(side='left',padx=3)
-        form = ttk.Frame(left)
+        form = ttk.Frame(form_body)
         form.pack(fill='x')
         self.fields = {}
         config = [
@@ -643,11 +708,11 @@ class App(tk.Tk):
             w.grid(row=i, column=1, sticky='ew', padx=8, pady=4)
             self.fields[key] = v
         form.columnconfigure(1, weight=1)
-        ttk.Label(left, text='Setup / Entry rationale').pack(anchor='w', pady=(10, 3))
-        self.setup_note = tk.Text(left, height=3, bg=ENTRY, fg=TEXT, insertbackground=TEXT, wrap='word', relief='flat')
+        ttk.Label(form_body, text='Setup / Entry rationale').pack(anchor='w', pady=(10, 3))
+        self.setup_note = tk.Text(form_body, height=5, bg=ENTRY, fg=TEXT, insertbackground=TEXT, wrap='word', relief='flat')
         self.setup_note.pack(fill='x')
-        ttk.Label(left, text='Post-trade review / lessons').pack(anchor='w', pady=(9, 3))
-        self.review_note = tk.Text(left, height=3, bg=ENTRY, fg=TEXT, insertbackground=TEXT, wrap='word', relief='flat')
+        ttk.Label(form_body, text='Post-trade review / lessons').pack(anchor='w', pady=(9, 3))
+        self.review_note = tk.Text(form_body, height=5, bg=ENTRY, fg=TEXT, insertbackground=TEXT, wrap='word', relief='flat')
         self.review_note.pack(fill='x')
         ttk.Label(right, text='CHART EVIDENCE  •  BEFORE / AFTER', font=('Segoe UI Semibold', 17)).pack(anchor='w', pady=(0, 6))
         ttk.Label(right, text='Six chart slots per trade. Choose an image or paste a screenshot from the clipboard.', style='Muted.TLabel').pack(anchor='w', pady=(0, 12))
@@ -670,6 +735,13 @@ class App(tk.Tk):
             self.image_cards[slot] = preview
         for i in range(3):grid.columnconfigure(i, weight=1)
         for i in range(2):grid.rowconfigure(i, weight=1)
+        # Keep the last field visible and give a visual cue that scrolling works.
+        ttk.Label(form_body, text='Scroll to reach all editor fields  •  Mouse wheel / scrollbar',
+                  style='Muted.TLabel').pack(anchor='w', pady=(10, 14))
+        bind_editor_wheel(form_body)
+        editor_canvas.bind('<MouseWheel>', scroll_editor, add='+')
+        editor_canvas.bind('<Button-4>', scroll_editor, add='+')
+        editor_canvas.bind('<Button-5>', scroll_editor, add='+')
         self.new_trade()
 
     def _all_trades(self):
