@@ -1,5 +1,9 @@
-"""Layaq Trading Journal Super App â€” local-first Windows trading journal."""
+"""Layaq Trading Journal Super App — local-first Windows trading journal."""
 import csv
+import hashlib
+import hmac
+import json
+import secrets
 import datetime as dt
 import os
 import shutil
@@ -8,29 +12,40 @@ import sys
 import uuid
 import zipfile
 from pathlib import Path
+from contextlib import contextmanager, closing
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 APP_NAME = 'Layaq Trading Journal Super App'
 BASE = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'LayaqTradingJournal'
 IMAGES = BASE / 'images'
 DB = BASE / 'journal.sqlite3'
 BACKUPS = BASE / 'backups'
+AUTH = BASE / 'access.json'
 BASE.mkdir(parents=True, exist_ok=True)
 IMAGES.mkdir(exist_ok=True)
 BACKUPS.mkdir(exist_ok=True)
 
 BG, PANEL, ENTRY, TEXT, MUTED, ACCENT, GREEN, RED = '#101622', '#1c2534', '#263248', '#eef3fb', '#9aabc1', '#4aa3ff', '#42ce9b', '#ff687c'
 IMAGE_FIELDS = [f'{stage.lower()}_{tf.lower()}' for stage in ('Before', 'After') for tf in ('HTF', 'MTF', 'LTF')]
-COLUMNS = ['date', 'symbol', 'market', 'side', 'session', 'strategy', 'entry', 'exit', 'stop', 'target', 'size', 'risk', 'fees', 'pnl', 'emotion', 'setup', 'review']
+COLUMNS = ['date', 'symbol', 'market', 'side', 'session', 'strategy', 'entry', 'exit', 'stop', 'target', 'size', 'risk', 'fees', 'pnl', 'pnl_high', 'pnl_low', 'emotion', 'setup', 'review']
 
 
+@contextmanager
 def connect():
-    cn = sqlite3.connect(DB)
-    cn.row_factory = sqlite3.Row
-    cn.execute('PRAGMA foreign_keys=ON')
-    cn.execute('PRAGMA journal_mode=WAL')
-    return cn
+    """Commit or roll back and ALWAYS close; SQLite's own with does not close."""
+    cn = sqlite3.connect(DB, timeout=20)
+    try:
+        cn.row_factory = sqlite3.Row
+        cn.execute('PRAGMA foreign_keys=ON')
+        cn.execute('PRAGMA journal_mode=WAL')
+        yield cn
+        cn.commit()
+    except Exception:
+        cn.rollback()
+        raise
+    finally:
+        cn.close()
 
 
 def setup():
@@ -39,17 +54,59 @@ def setup():
             id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, symbol TEXT NOT NULL,
             market TEXT, side TEXT, session TEXT, strategy TEXT, entry REAL,
             exit REAL, stop REAL, target REAL, size REAL, risk REAL, fees REAL,
-            pnl REAL, emotion TEXT, setup TEXT, review TEXT, created_at TEXT NOT NULL)''')
+            pnl REAL, pnl_high REAL, pnl_low REAL, emotion TEXT, setup TEXT, review TEXT, created_at TEXT NOT NULL)''')
         cn.execute('''CREATE TABLE IF NOT EXISTS trade_images (
             trade_id INTEGER NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
             slot TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(trade_id, slot))''')
+        existing = {r[1] for r in cn.execute('PRAGMA table_info(trades)')}
+        for name in ('pnl_high', 'pnl_low'):
+            if name not in existing: cn.execute(f'ALTER TABLE trades ADD COLUMN {name} REAL')
         cn.execute('CREATE INDEX IF NOT EXISTS ix_trades_date ON trades(date)')
         cn.execute('CREATE INDEX IF NOT EXISTS ix_trades_symbol ON trades(symbol)')
 
 
+
+def password_digest(password, salt):
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 310000).hex()
+
+
+def require_access(root):
+    """A local application lock, not database encryption."""
+    if not AUTH.exists():
+        messagebox.showinfo('First-time security setup', 'Set a password (at least 8 characters). Keep it safe: there is no password recovery.', parent=root)
+        for _ in range(3):
+            pw = simpledialog.askstring('Create password', 'New application password:', show='*', parent=root)
+            if pw is None: return False
+            if len(pw) < 8:
+                messagebox.showwarning('Password', 'Use at least 8 characters.', parent=root)
+                continue
+            confirm = simpledialog.askstring('Confirm password', 'Repeat password:', show='*', parent=root)
+            if confirm != pw:
+                messagebox.showwarning('Password', 'Passwords do not match.', parent=root)
+                continue
+            salt = secrets.token_hex(16)
+            AUTH.write_text(json.dumps({'salt':salt,'digest':password_digest(pw,salt)}),encoding='utf-8')
+            return True
+        return False
+    try:
+        record=json.loads(AUTH.read_text(encoding='utf-8'))
+        for _ in range(3):
+            pw=simpledialog.askstring('Unlock Layaq', 'Enter your app password:', show='*', parent=root)
+            if pw is None: return False
+            if hmac.compare_digest(password_digest(pw,record['salt']),record['digest']): return True
+            messagebox.showerror('Access denied','Incorrect password.',parent=root)
+    except (ValueError,KeyError,OSError) as exc:
+        messagebox.showerror('Security error',f'Cannot read local authentication settings: {exc}',parent=root)
+    return False
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.withdraw()
+        if not require_access(self):
+            self.destroy()
+            return
+        self.deiconify()
         setup()
         self.title(APP_NAME)
         self.geometry('1380x840')
@@ -87,7 +144,7 @@ class App(tk.Tk):
         header = tk.Frame(self, bg=BG)
         header.pack(fill='x', padx=22, pady=(16, 6))
         tk.Label(header, text='LAYAQ  /  TRADING JOURNAL', font=('Segoe UI Semibold', 23), bg=BG, fg=TEXT).pack(side='left')
-        tk.Label(header, text='SUPER APP   â€¢   OFFLINE', font=('Segoe UI', 10), bg=BG, fg=GREEN).pack(side='left', padx=18)
+        tk.Label(header, text='SUPER APP   •   OFFLINE', font=('Segoe UI', 10), bg=BG, fg=GREEN).pack(side='left', padx=18)
         ttk.Button(header, text='Backup', command=self.backup).pack(side='right', padx=4)
         ttk.Button(header, text='Restore', command=self.restore).pack(side='right', padx=4)
         ttk.Button(header, text='Export CSV', command=self.export_csv).pack(side='right', padx=4)
@@ -111,7 +168,7 @@ class App(tk.Tk):
             box = tk.Frame(self.stats_frame, bg=PANEL, padx=13, pady=12)
             box.pack(side='left', fill='both', expand=True, padx=5)
             tk.Label(box, text=name, bg=PANEL, fg=MUTED).pack(anchor='w')
-            value = tk.Label(box, text='â€”', font=('Segoe UI Semibold', 16), bg=PANEL, fg=TEXT)
+            value = tk.Label(box, text='—', font=('Segoe UI Semibold', 16), bg=PANEL, fg=TEXT)
             value.pack(anchor='w', pady=(7, 0))
             self.stats[name] = value
         controls = ttk.Frame(self.dashboard)
@@ -159,103 +216,180 @@ class App(tk.Tk):
             ttk.Label(row, text='Chart:').pack(side='left', padx=(20,4))
             kind = tk.StringVar(value='Line')
             self.date_vars[(period, 'chart')] = kind
-            ttk.Combobox(row, textvariable=kind, values=['Line', 'Bar', 'Area'], state='readonly', width=9).pack(side='left', padx=4)
+            ttk.Combobox(row, textvariable=kind, values=['Line', 'Candlestick', 'Area'], state='readonly', width=9).pack(side='left', padx=4)
             kind.trace_add('write', lambda *_a, p=period: self.draw_period(p))
+            ttk.Label(row, text='Candle interval:').pack(side='left', padx=(14,4))
+            interval = tk.StringVar(value='1 Hour')
+            self.date_vars[(period, 'interval')] = interval
+            ttk.Combobox(row, textvariable=interval,
+                         values=['1 Minute', '5 Minutes', '15 Minutes', '30 Minutes', '1 Hour', '4 Hours', '1 Day', '1 Week', '1 Month', '1 Year'],
+                         state='readonly', width=13).pack(side='left', padx=4)
+            interval.trace_add('write', lambda *_a, p=period: self.draw_period(p))
             canvas = tk.Canvas(frame, bg=PANEL, highlightthickness=0)
             canvas.pack(fill='both', expand=True, padx=5, pady=(0, 5))
             self.period_canvases[period] = canvas
             canvas.bind('<Configure>', lambda _e, p=period: self.draw_period(p))
+            canvas.bind('<Motion>', lambda e, p=period: self.chart_hover(p, e))
+            canvas.bind('<Leave>', lambda _e, p=period: self.chart_unhover(p))
         self.period_tabs.bind('<<NotebookTabChanged>>', lambda _e: self.refresh())
-        tk.Label(self.dashboard, text='Charts show realized P&L only. Select a date/week/month/year and choose Line, Bar, or Area.', bg=BG, fg=MUTED).pack(anchor='w', padx=6, pady=8)
+        tk.Label(self.dashboard, text='Line & Area: each closed trade  |  Candles: interval OHLC from cumulative realized P&L  |  Hover for exact details. Inter-trade peaks are unknown.', bg=BG, fg=MUTED).pack(anchor='w', padx=6, pady=8)
 
     def period_data(self, period):
-        rows = [r for r in self._all_trades() if r['pnl'] is not None]
-        selected = []
-        buckets = {}
-        for r in rows:
+        selected=[]
+        for row in self._all_trades():
+            if row['pnl'] is None: continue
             try:
-                stamp = dt.datetime.fromisoformat(r['date'].strip().replace('Z', '+00:00'))
-                day = stamp.date()
-                year = int(self.date_vars[(period, 'year')].get()) if period != 'All Time' else 0
-                if period == 'Daily':
-                    if (day.year, day.month, day.day) != (year, int(self.date_vars[(period, 'month')].get()), int(self.date_vars[(period, 'day')].get())): continue
-                    key = f'{stamp.hour:02d}:00'
-                elif period == 'Weekly':
-                    iso = day.isocalendar()
-                    if (iso.year, iso.week) != (year, int(self.date_vars[(period, 'week')].get())):continue
-                    key = f'{day.isoweekday()} {day.strftime("%a")}'
-                elif period == 'Monthly':
-                    if (day.year, day.month) != (year, int(self.date_vars[(period, 'month')].get())):continue
-                    key = f'{day.day:02d}'
-                elif period == 'Yearly':
-                    if day.year != year:continue
-                    key = f'{day.month:02d}'
-                else:
-                    key = day.strftime('%Y-%m')
-                selected.append(r)
-                buckets[key] = buckets.get(key, 0.0) + r['pnl']
-            except (ValueError, TypeError, AttributeError):
-                continue
-        if period == 'Daily': keys=[f'{x:02d}:00' for x in range(24)]
-        elif period == 'Weekly': keys=[f'{i} {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][i-1]}' for i in range(1,8)]
-        elif period == 'Monthly':
-            import calendar
-            try: count=calendar.monthrange(int(self.date_vars[(period,'year')].get()),int(self.date_vars[(period,'month')].get()))[1]
-            except ValueError: count=31
-            keys=[f'{x:02d}' for x in range(1,count+1)]
-        elif period == 'Yearly': keys=[f'{x:02d}' for x in range(1,13)]
-        else:keys=sorted(buckets)
-        return selected, keys, [buckets.get(k,0.0) for k in keys]
+                stamp=dt.datetime.fromisoformat(row['date'].strip().replace('Z','+00:00'))
+                day=stamp.date()
+                if period != 'All Time':
+                    year=int(self.date_vars[(period,'year')].get())
+                    if period=='Daily' and (day.year,day.month,day.day)!=(year,int(self.date_vars[(period,'month')].get()),int(self.date_vars[(period,'day')].get())):continue
+                    if period=='Weekly' and (day.isocalendar().year,day.isocalendar().week)!=(year,int(self.date_vars[(period,'week')].get())):continue
+                    if period=='Monthly' and (day.year,day.month)!=(year,int(self.date_vars[(period,'month')].get())):continue
+                    if period=='Yearly' and day.year!=year:continue
+                selected.append(row)
+            except (ValueError,TypeError,AttributeError):pass
+        return selected, [float(r['pnl']) for r in selected]
+
+    @staticmethod
+    def _bucket_start(stamp, interval):
+        if interval == '1 Year': return stamp.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        if interval == '1 Month': return stamp.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if interval == '1 Week':
+            stamp = stamp - dt.timedelta(days=stamp.weekday())
+            return stamp.replace(hour=0, minute=0, second=0, microsecond=0)
+        if interval == '1 Day': return stamp.replace(hour=0, minute=0, second=0, microsecond=0)
+        mins = {'1 Minute':1, '5 Minutes':5, '15 Minutes':15, '30 Minutes':30, '1 Hour':60, '4 Hours':240}[interval]
+        minute_of_day = (stamp.hour * 60 + stamp.minute) // mins * mins
+        return stamp.replace(hour=minute_of_day//60, minute=minute_of_day%60, second=0, microsecond=0)
+
+    def _chart_points(self, period):
+        # Start at the genuine all-time realized P&L BEFORE the filtered interval.
+        # No fictional intratrade price path is inferred from final trade results.
+        rows, _ = self.period_data(period)
+        included = {r['id'] for r in rows}
+        running = 0.0
+        result = []
+        for row in self._all_trades():
+            if row['pnl'] is None: continue
+            opening = running
+            running += float(row['pnl'])
+            if row['id'] not in included: continue
+            try: stamp = dt.datetime.fromisoformat(row['date'].strip().replace('Z', '+00:00'))
+            except (ValueError, TypeError, AttributeError): continue
+            result.append({'id':row['id'], 'date':stamp, 'open':opening, 'close':running,
+                           'pnl':float(row['pnl']), 'symbol':row['symbol']})
+        return result
 
     def draw_period(self, period):
         if not hasattr(self, 'period_canvases') or period not in self.period_canvases:return
-        c=self.period_canvases[period]
+        c = self.period_canvases[period]
         c.delete('all')
-        w,h=c.winfo_width(),c.winfo_height()
+        c._hover_data = []
+        w, h = c.winfo_width(), c.winfo_height()
         if w < 100 or h < 100:return
-        rows, labels, values=self.period_data(period)
-        cumulative=[]
-        total=0.0
-        for v in values:
-            total+=v
-            cumulative.append(total)
-        kind=self.date_vars[(period,'chart')].get()
-        title=f'{period.upper()}  /  {kind.upper()}  /  REALIZED NET P&L'
-        c.create_text(24,23,text=title,anchor='w',fill=TEXT,font=('Segoe UI Semibold',14))
-        pad_l,pad_r,pad_top,pad_bottom=70,30,55,63
-        if not labels:
-            c.create_text(w/2,h/2,text='No closed trades for this period',fill=MUTED,font=('Segoe UI',13))
+        trades = self._chart_points(period)
+        kind = self.date_vars[(period, 'chart')].get()
+        interval = self.date_vars[(period, 'interval')].get()
+        c.create_text(24, 22, text=f'{period.upper()} / {kind.upper()} / REALIZED EQUITY', anchor='w', fill=TEXT, font=('Segoe UI Semibold', 14))
+        if not trades:
+            c.create_text(w/2, h/2, text='No closed trades for this period', fill=MUTED, font=('Segoe UI', 13))
             return
-        # Bar chart shows P&L of each bucket; line and area show cumulative P&L.
-        series = values if kind=='Bar' else cumulative
-        lo=min([0]+series);hi=max([0]+series)
-        if lo==hi:lo-=1;hi+=1
-        margin=(hi-lo)*.10
-        lo-=margin;hi+=margin
-        plot_w=max(10,w-pad_l-pad_r);plot_h=max(10,h-pad_top-pad_bottom)
-        def xx(i):return pad_l+(i+.5)*plot_w/max(1,len(labels))
-        def yy(v):return pad_top+(hi-v)*plot_h/(hi-lo)
+        # Each candle represents a time bucket, not a trade. OHLC reflects
+        # observable equity levels at bucket start and after each closed trade.
+        buckets = []
+        for trade in trades:
+            stamp = self._bucket_start(trade['date'], interval)
+            if not buckets or buckets[-1]['time'] != stamp:
+                buckets.append({'time':stamp, 'open':trade['open'], 'high':max(trade['open'], trade['close']),
+                                'low':min(trade['open'], trade['close']), 'close':trade['close'], 'count':1,
+                                'ids':[trade['id']]})
+            else:
+                b = buckets[-1]
+                b['high'] = max(b['high'], trade['close'])
+                b['low'] = min(b['low'], trade['close'])
+                b['close'] = trade['close']
+                b['count'] += 1
+                b['ids'].append(trade['id'])
+        displayed = buckets if kind == 'Candlestick' else trades
+        extrema = ([t['open'] for t in trades] + [t['close'] for t in trades]) if kind != 'Candlestick' else ([b['low'] for b in buckets] + [b['high'] for b in buckets])
+        lo, hi = min(extrema), max(extrema)
+        if lo == hi: lo -= 1; hi += 1
+        pad = (hi-lo)*0.09
+        lo -= pad; hi += pad
+        left, right, top, bottom = 83, 36, 55, 75
+        width = max(10, w-left-right)
+        height = max(10, h-top-bottom)
+        def xx(i):return left + (i+.5)*width/len(displayed)
+        def yy(v):return top + (hi-v)*height/(hi-lo)
         for j in range(5):
-            v=lo+(hi-lo)*j/4;y=yy(v)
-            c.create_line(pad_l,y,w-pad_r,y,fill='#344052',dash=(3,5))
-            c.create_text(pad_l-10,y,text=f'{v:,.0f}',anchor='e',fill=MUTED)
-        zero=yy(0)
-        if kind=='Bar':
-            width=max(2,min(48,plot_w/max(1,len(labels))*.72))
-            for i,v in enumerate(values):
-                x=xx(i);y=yy(v)
-                c.create_rectangle(x-width/2,min(y,zero),x+width/2,max(y,zero)+1,fill=GREEN if v>=0 else RED,outline='')
+            val=lo+(hi-lo)*j/4
+            y=yy(val)
+            c.create_line(left,y,w-right,y,fill='#344052',dash=(3,5))
+            c.create_text(left-9,y,text=f'{val:+,.2f}',anchor='e',fill=MUTED)
+        if lo <= 0 <= hi:
+            c.create_line(left,yy(0),w-right,yy(0),fill='#667589',dash=(2,3))
+        if kind == 'Candlestick':
+            cw=max(2,min(30,width/max(1,len(buckets))*.65))
+            for i,b in enumerate(buckets):
+                x=xx(i)
+                color = GREEN if b['close'] >= b['open'] else RED
+                c.create_line(x, yy(b['high']), x, yy(b['low']), fill=color, width=2)
+                y0,y1=yy(b['open']),yy(b['close'])
+                c.create_rectangle(x-cw/2,min(y0,y1),x+cw/2,max(y0,y1)+1,fill=color,outline=color)
+                label=b['time'].strftime('%Y-%m-%d %H:%M')
+                hover=(f'{label}  |  {b["count"]} trades\n'
+                       f'Open: {b["open"]:+,.2f}     High: {b["high"]:+,.2f}\n'
+                       f'Low: {b["low"]:+,.2f}     Close: {b["close"]:+,.2f}\n'
+                       f'Net: {b["close"]-b["open"]:+,.2f}')
+                c._hover_data.append((x, hover, yy(b['close'])))
         else:
-            points=[]
-            for i,v in enumerate(series):points.extend([xx(i),yy(v)])
-            if kind=='Area' and len(points)>=4:
-                c.create_polygon([xx(0),zero]+points+[xx(len(series)-1),zero],fill='#245483',outline='')
-            if len(points)>=4:c.create_line(*points,fill=GREEN if total>=0 else RED,width=3)
-            elif len(points)==2:c.create_oval(points[0]-3,points[1]-3,points[0]+3,points[1]+3,fill=GREEN,outline='')
-        stride=max(1,(len(labels)+11)//12)
-        for i,label in enumerate(labels):
-            if i%stride==0 or i==len(labels)-1:c.create_text(xx(i),h-42,text=label,fill=MUTED,font=('Segoe UI',9))
-        c.create_text(w-pad_r,h-15,anchor='e',text=f'{len(rows)} closed trades  â€¢  Net P&L: {sum(values):+,.2f}',fill=TEXT)
+            points=[(left,yy(trades[0]['open']))]
+            points += [(xx(i),yy(t['close'])) for i,t in enumerate(trades)]
+            flat=[n for xy in points for n in xy]
+            if kind=='Area':
+                base=yy(0) if lo<=0<=hi else yy(lo)
+                c.create_polygon([points[0][0],base]+flat+[points[-1][0],base],fill='#245483',outline='')
+            c.create_line(*flat, fill=GREEN if trades[-1]['close']>=trades[0]['open'] else RED, width=2)
+            for i,t in enumerate(trades):
+                x,y=xx(i), yy(t['close'])
+                color=GREEN if t['pnl']>=0 else RED
+                c.create_oval(x-3,y-3,x+3,y+3,fill=color,outline='')
+                hover=(f'Trade #{t["id"]}  |  {t["date"].strftime("%Y-%m-%d %H:%M")}\n'
+                       f'{t["symbol"]}  |  Trade P&L: {t["pnl"]:+,.2f}\n'
+                       f'Equity: {t["open"]:+,.2f} → {t["close"]:+,.2f}')
+                c._hover_data.append((x,hover,y))
+        stride=max(1,(len(displayed)+9)//10)
+        for i,item in enumerate(displayed):
+            if i%stride == 0 or i == len(displayed)-1:
+                txt=item['time'].strftime('%m-%d %H:%M') if kind=='Candlestick' else f'#{item["id"]}'
+                c.create_text(xx(i),h-46,text=txt,fill=MUTED,font=('Segoe UI',9))
+        net=sum(t['pnl'] for t in trades)
+        c.create_text(w-right,h-16,anchor='e',text=f'{len(trades)} trades  •  Period P&L: {net:+,.2f}  •  Hover over chart for values',fill=TEXT)
+
+    def chart_unhover(self, period):
+        if period in self.period_canvases:
+            self.period_canvases[period].delete('chart_tooltip')
+
+    def chart_hover(self, period, event):
+        c=self.period_canvases.get(period)
+        if not c:return
+        c.delete('chart_tooltip')
+        items=getattr(c,'_hover_data',[])
+        if not items or event.x<75 or event.x>c.winfo_width()-25:return
+        nearest=min(items,key=lambda item: abs(item[0]-event.x))
+        # Show the nearest time bucket/trade, even in dense charts.
+        x,msg,y=nearest
+        lines=msg.split('\n')
+        fontsize=10
+        box_w=min(c.winfo_width()-20,max(250,max(len(s) for s in lines)*7+24))
+        box_h=len(lines)*21+18
+        tx=max(10,min(c.winfo_width()-box_w-10,x+13))
+        ty=max(34,min(c.winfo_height()-box_h-10,event.y-22))
+        c.create_line(x,55,x,c.winfo_height()-74,fill='#7085a2',dash=(3,3),tags='chart_tooltip')
+        c.create_rectangle(tx,ty,tx+box_w,ty+box_h,fill='#111c2b',outline='#5f7797',tags='chart_tooltip')
+        for i,line in enumerate(lines):
+            c.create_text(tx+12,ty+16+i*21,text=line,anchor='w',fill=TEXT,font=('Segoe UI',fontsize),tags='chart_tooltip')
 
     def _make_history(self):
         bar = ttk.Frame(self.history)
@@ -302,7 +436,8 @@ class App(tk.Tk):
             ('entry','Entry price','entry'), ('exit','Exit price','entry'), ('stop','Stop loss','entry'),
             ('target','Take profit','entry'), ('size','Position size / lots','entry'),
             ('risk','Risk amount','entry'), ('fees','Fees / commission','entry'),
-            ('pnl','Realized net P&L','entry'), ('emotion','Emotion','combo')]
+            ('pnl','Realized net P&L','entry'),
+            ('pnl_high','Trade peak P&L (optional)','entry'), ('pnl_low','Trade trough P&L (optional)','entry'), ('emotion','Emotion','combo')]
         choices = {'market':['Forex','Gold','Crypto','Stocks','Indices','Other'],
                    'side':['Buy','Sell'], 'session':['Asia','London','New York','Overlap','Other'],
                    'emotion':['Calm','Confident','Fear','Greed','FOMO','Revenge','Impatient','Other']}
@@ -323,7 +458,7 @@ class App(tk.Tk):
         actions.pack(fill='x', pady=14)
         ttk.Button(actions, text='Save Trade', style='Accent.TButton', command=self.save_trade).pack(side='left', padx=3)
         ttk.Button(actions, text='Clear / New', command=self.new_trade).pack(side='left', padx=3)
-        ttk.Label(right, text='CHART EVIDENCE  â€¢  BEFORE / AFTER', font=('Segoe UI Semibold', 17)).pack(anchor='w', pady=(0, 6))
+        ttk.Label(right, text='CHART EVIDENCE  •  BEFORE / AFTER', font=('Segoe UI Semibold', 17)).pack(anchor='w', pady=(0, 6))
         ttk.Label(right, text='Six chart slots per trade. Choose an image or paste a screenshot from the clipboard.', style='Muted.TLabel').pack(anchor='w', pady=(0, 12))
         grid = ttk.Frame(right)
         grid.pack(fill='both', expand=True)
@@ -366,10 +501,10 @@ class App(tk.Tk):
             maxdd = max(maxdd, peak - equity)
         stats = {
             'Total Trades': str(len(rows)),
-            'Win Rate': f'{len(wins)/len(pnls)*100:.1f}%' if pnls else 'â€”',
+            'Win Rate': f'{len(wins)/len(pnls)*100:.1f}%' if pnls else '—',
             'Net P&L': f'{sum(pnls):+,.2f}',
-            'Profit Factor': f'{grosswin/grossloss:.2f}' if grossloss else ('âˆž' if grosswin else 'â€”'),
-            'Avg Win / Loss': f'{grosswin/len(wins):,.2f} / {grossloss/len(losses):,.2f}' if wins and losses else 'â€”',
+            'Profit Factor': f'{grosswin/grossloss:.2f}' if grossloss else ('∞' if grosswin else '—'),
+            'Avg Win / Loss': f'{grosswin/len(wins):,.2f} / {grossloss/len(losses):,.2f}' if wins and losses else '—',
             'Max Drawdown': f'{maxdd:,.2f}' }
         for name, val in stats.items():self.stats[name].config(text=val)
         if hasattr(self,'period_canvases'):
@@ -430,7 +565,7 @@ class App(tk.Tk):
         if not values['symbol']:return messagebox.showwarning('Required','Enter a symbol.')
         try:dt.datetime.strptime(values['date'],'%Y-%m-%d %H:%M')
         except ValueError:return messagebox.showwarning('Invalid date','Use YYYY-MM-DD HH:MM.')
-        for k in ('entry','exit','stop','target','size','risk','fees','pnl'):
+        for k in ('entry','exit','stop','target','size','risk','fees','pnl','pnl_high','pnl_low'):
             try:values[k]=float(values[k]) if values[k] else None
             except ValueError:return messagebox.showwarning('Invalid number',f'{k} must be a number.')
         values['setup']=self.setup_note.get('1.0','end').strip()
@@ -544,7 +679,7 @@ class App(tk.Tk):
         dest=filedialog.asksaveasfilename(defaultextension='.zip',initialfile=f'layaq_backup_{dt.date.today().isoformat()}.zip',filetypes=[('ZIP archive','*.zip')])
         if not dest:return
         temp=BASE/f'_backup_{uuid.uuid4().hex}.sqlite3'
-        with connect() as source, sqlite3.connect(temp) as target:source.backup(target)
+        with connect() as source, closing(sqlite3.connect(temp)) as target:source.backup(target)
         try:
             with zipfile.ZipFile(dest,'w',compression=zipfile.ZIP_DEFLATED) as z:
                 z.write(temp,'journal.sqlite3')
@@ -556,62 +691,55 @@ class App(tk.Tk):
     def restore(self):
         archive=filedialog.askopenfilename(filetypes=[('ZIP archive','*.zip')])
         if not archive:return
-        if not messagebox.askyesno('Restore backup','This replaces the current journal and images. Please keep a separate backup first. Continue?'):return
+        if not messagebox.askyesno('Restore backup','This replaces the current journal and images. Make a separate backup first. Continue?'):return
         staging=BASE/f'_restore_{uuid.uuid4().hex}'
         staging.mkdir()
-        old_db=BASE/f'_old_{uuid.uuid4().hex}.sqlite3'
-        old_images=BASE/f'_old_images_{uuid.uuid4().hex}'
+        recovery=staging/'original.sqlite3'
         try:
             with zipfile.ZipFile(archive) as z:
                 names=z.namelist()
-                if 'journal.sqlite3' not in names:raise ValueError('Not a Layaq backup: journal.sqlite3 is missing.')
-                if any(n.startswith('/') or '\\' in n or '..' in Path(n).parts for n in names):raise ValueError('Unsafe file path in archive.')
-                if z.testzip() is not None:raise ValueError('Backup ZIP contains a corrupted file.')
-                staged_db=staging/'journal.sqlite3'
-                staged_db.write_bytes(z.read('journal.sqlite3'))
+                if 'journal.sqlite3' not in names:raise ValueError('Missing journal.sqlite3 in backup.')
+                if any(n.startswith('/') or '\\' in n or '..' in Path(n).parts for n in names):raise ValueError('Unsafe backup paths.')
+                if z.testzip() is not None:raise ValueError('Corrupt backup archive.')
+                staged_db=staging/'new.sqlite3';staged_db.write_bytes(z.read('journal.sqlite3'))
                 image_dir=staging/'images';image_dir.mkdir()
                 for n in names:
                     if n.startswith('images/') and not n.endswith('/'):
-                        if Path(n).name != n[7:]:raise ValueError('Unexpected nested screenshot path.')
+                        if Path(n).name!=n[7:]:raise ValueError('Invalid image path.')
                         (image_dir/Path(n).name).write_bytes(z.read(n))
-            # Verify the backup before touching any active journal files.
-            with sqlite3.connect(staged_db) as restored:
-                if restored.execute('PRAGMA integrity_check').fetchone()[0]!='ok':raise ValueError('Database integrity check failed.')
+            with closing(sqlite3.connect(staged_db)) as restored:
+                if restored.execute('PRAGMA integrity_check').fetchone()[0]!='ok':raise ValueError('Backup database failed integrity check.')
                 tables={r[0] for r in restored.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if not {'trades','trade_images'}.issubset(tables):raise ValueError('Not a compatible Layaq journal backup.')
-                for tid,slot,old_path in restored.execute('SELECT trade_id,slot,path FROM trade_images').fetchall():
-                    filename=Path(str(old_path).replace('\\','/')).name
-                    if not (image_dir/filename).is_file():raise ValueError(f'Backup missing screenshot: {filename}')
+                if not {'trades','trade_images'}.issubset(tables):raise ValueError('Not a compatible journal backup.')
+                for tid,slot,oldpath in restored.execute('SELECT trade_id,slot,path FROM trade_images').fetchall():
+                    filename=Path(str(oldpath).replace('\\','/')).name
+                    if not (image_dir/filename).is_file():raise ValueError(f'Missing screenshot: {filename}')
                     restored.execute('UPDATE trade_images SET path=? WHERE trade_id=? AND slot=?',(str(IMAGES/filename),tid,slot))
                 restored.commit()
-                # WAL -> DELETE: guarantees a single self-contained database file.
-                restored.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                restored.execute('PRAGMA journal_mode=DELETE')
-            # SQLite connection from connect() uses WAL; checkpoint and close before swapping.
-            with connect() as current:current.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            if DB.exists():shutil.copy2(DB,old_db)
-            shutil.copytree(IMAGES,old_images)
+            # SQLite's supported backup API replaces database CONTENTS without Windows
+            # file renames; no os.replace() or access-denied swap of journal.sqlite3.
+            with closing(sqlite3.connect(DB)) as live, closing(sqlite3.connect(recovery)) as saved:
+                live.backup(saved)
+            with closing(sqlite3.connect(staged_db)) as source, closing(sqlite3.connect(DB,timeout=20)) as target:
+                source.backup(target)
+            # Preserve original images until replacement is verified.
+            old_images=staging/'old_images';shutil.copytree(IMAGES,old_images)
             try:
-                os.replace(staged_db,DB)
-                for sidecar in ('-wal','-shm'):Path(str(DB)+sidecar).unlink(missing_ok=True)
                 for f in IMAGES.iterdir():
                     if f.is_file():f.unlink()
                 for f in image_dir.iterdir():shutil.copy2(f,IMAGES/f.name)
                 setup()
             except Exception:
-                if old_db.exists():os.replace(old_db,DB)
-                if old_images.exists():
-                    shutil.rmtree(IMAGES,ignore_errors=True)
-                    shutil.copytree(old_images,IMAGES)
+                with closing(sqlite3.connect(recovery)) as source, closing(sqlite3.connect(DB,timeout=20)) as target:
+                    source.backup(target)
+                shutil.rmtree(IMAGES,ignore_errors=True);shutil.copytree(old_images,IMAGES)
                 raise
             self.new_trade();self.refresh()
-            messagebox.showinfo('Restored','Your trades and all six screenshot slots were restored successfully.')
-        except Exception as e:
-            messagebox.showerror('Restore failed',str(e))
+            messagebox.showinfo('Restore complete','Trades and screenshots have been restored. Login password was not changed.')
+        except Exception as exc:
+            messagebox.showerror('Restore failed',str(exc))
         finally:
             shutil.rmtree(staging,ignore_errors=True)
-            old_db.unlink(missing_ok=True)
-            shutil.rmtree(old_images,ignore_errors=True)
 
 if __name__=='__main__':
     App().mainloop()
