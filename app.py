@@ -1,4 +1,4 @@
-"""Layaq Trading Journal Super App — local-first Windows trading journal."""
+"""Layaq Trading Journal Super App â€” local-first Windows trading journal."""
 import csv
 import datetime as dt
 import os
@@ -87,7 +87,7 @@ class App(tk.Tk):
         header = tk.Frame(self, bg=BG)
         header.pack(fill='x', padx=22, pady=(16, 6))
         tk.Label(header, text='LAYAQ  /  TRADING JOURNAL', font=('Segoe UI Semibold', 23), bg=BG, fg=TEXT).pack(side='left')
-        tk.Label(header, text='SUPER APP   •   OFFLINE', font=('Segoe UI', 10), bg=BG, fg=GREEN).pack(side='left', padx=18)
+        tk.Label(header, text='SUPER APP   â€¢   OFFLINE', font=('Segoe UI', 10), bg=BG, fg=GREEN).pack(side='left', padx=18)
         ttk.Button(header, text='Backup', command=self.backup).pack(side='right', padx=4)
         ttk.Button(header, text='Restore', command=self.restore).pack(side='right', padx=4)
         ttk.Button(header, text='Export CSV', command=self.export_csv).pack(side='right', padx=4)
@@ -105,21 +105,157 @@ class App(tk.Tk):
 
     def _make_dashboard(self):
         self.stats_frame = ttk.Frame(self.dashboard)
-        self.stats_frame.pack(fill='x', pady=(12, 18))
+        self.stats_frame.pack(fill='x', pady=(12, 12))
         self.stats = {}
         for name in ('Total Trades', 'Win Rate', 'Net P&L', 'Profit Factor', 'Avg Win / Loss', 'Max Drawdown'):
-            box = tk.Frame(self.stats_frame, bg=PANEL, padx=13, pady=16)
+            box = tk.Frame(self.stats_frame, bg=PANEL, padx=13, pady=12)
             box.pack(side='left', fill='both', expand=True, padx=5)
             tk.Label(box, text=name, bg=PANEL, fg=MUTED).pack(anchor='w')
-            value = tk.Label(box, text='—', font=('Segoe UI Semibold', 17), bg=PANEL, fg=TEXT)
-            value.pack(anchor='w', pady=(8, 0))
+            value = tk.Label(box, text='â€”', font=('Segoe UI Semibold', 16), bg=PANEL, fg=TEXT)
+            value.pack(anchor='w', pady=(7, 0))
             self.stats[name] = value
-        charts = ttk.Frame(self.dashboard)
-        charts.pack(fill='both', expand=True)
-        self.graph = tk.Canvas(charts, bg=PANEL, highlightthickness=0)
-        self.graph.pack(fill='both', expand=True, padx=5)
-        self.graph.bind('<Configure>', lambda e: self.draw_equity())
-        tk.Label(self.dashboard, text='P&L is entered as realized account-currency P&L. Open trades are excluded from win/loss statistics.', bg=BG, fg=MUTED).pack(anchor='w', padx=6, pady=12)
+        controls = ttk.Frame(self.dashboard)
+        controls.pack(fill='x', pady=(0, 8))
+        self.period_tabs = ttk.Notebook(self.dashboard)
+        self.period_tabs.pack(fill='both', expand=True)
+        self.period_canvases = {}
+        self.date_vars = {}
+        today = dt.date.today()
+        for period in ('Daily', 'Weekly', 'Monthly', 'Yearly', 'All Time'):
+            frame = ttk.Frame(self.period_tabs)
+            self.period_tabs.add(frame, text=period)
+            row = ttk.Frame(frame)
+            row.pack(fill='x', padx=6, pady=8)
+            if period != 'All Time':
+                ttk.Label(row, text='Year:').pack(side='left', padx=4)
+                year = tk.StringVar(value=str(today.year))
+                self.date_vars[(period, 'year')] = year
+                years = list(range(today.year-15, today.year+6))
+                ttk.Combobox(row, textvariable=year, values=years, width=7, state='readonly').pack(side='left', padx=4)
+                year.trace_add('write', lambda *_a, p=period: self.draw_period(p))
+            if period == 'Daily':
+                ttk.Label(row, text='Month:').pack(side='left', padx=4)
+                month = tk.StringVar(value=f'{today.month:02d}')
+                self.date_vars[(period, 'month')] = month
+                ttk.Combobox(row, textvariable=month, values=[f'{m:02d}' for m in range(1,13)], width=5, state='readonly').pack(side='left', padx=4)
+                month.trace_add('write', lambda *_a, p=period: self.draw_period(p))
+                ttk.Label(row, text='Day:').pack(side='left', padx=4)
+                day = tk.StringVar(value=f'{today.day:02d}')
+                self.date_vars[(period, 'day')] = day
+                ttk.Combobox(row, textvariable=day, values=[f'{d:02d}' for d in range(1,32)], width=5, state='readonly').pack(side='left', padx=4)
+                day.trace_add('write', lambda *_a, p=period: self.draw_period(p))
+            elif period == 'Weekly':
+                ttk.Label(row, text='ISO Week:').pack(side='left', padx=4)
+                week = tk.StringVar(value=f'{today.isocalendar().week:02d}')
+                self.date_vars[(period, 'week')] = week
+                ttk.Combobox(row, textvariable=week, values=[f'{i:02d}' for i in range(1,54)], width=5, state='readonly').pack(side='left', padx=4)
+                week.trace_add('write', lambda *_a, p=period: self.draw_period(p))
+            elif period == 'Monthly':
+                ttk.Label(row, text='Month:').pack(side='left', padx=4)
+                month = tk.StringVar(value=f'{today.month:02d}')
+                self.date_vars[(period, 'month')] = month
+                ttk.Combobox(row, textvariable=month, values=[f'{m:02d}' for m in range(1,13)], width=5, state='readonly').pack(side='left', padx=4)
+                month.trace_add('write', lambda *_a, p=period: self.draw_period(p))
+            ttk.Label(row, text='Chart:').pack(side='left', padx=(20,4))
+            kind = tk.StringVar(value='Line')
+            self.date_vars[(period, 'chart')] = kind
+            ttk.Combobox(row, textvariable=kind, values=['Line', 'Bar', 'Area'], state='readonly', width=9).pack(side='left', padx=4)
+            kind.trace_add('write', lambda *_a, p=period: self.draw_period(p))
+            canvas = tk.Canvas(frame, bg=PANEL, highlightthickness=0)
+            canvas.pack(fill='both', expand=True, padx=5, pady=(0, 5))
+            self.period_canvases[period] = canvas
+            canvas.bind('<Configure>', lambda _e, p=period: self.draw_period(p))
+        self.period_tabs.bind('<<NotebookTabChanged>>', lambda _e: self.refresh())
+        tk.Label(self.dashboard, text='Charts show realized P&L only. Select a date/week/month/year and choose Line, Bar, or Area.', bg=BG, fg=MUTED).pack(anchor='w', padx=6, pady=8)
+
+    def period_data(self, period):
+        rows = [r for r in self._all_trades() if r['pnl'] is not None]
+        selected = []
+        buckets = {}
+        for r in rows:
+            try:
+                stamp = dt.datetime.fromisoformat(r['date'].strip().replace('Z', '+00:00'))
+                day = stamp.date()
+                year = int(self.date_vars[(period, 'year')].get()) if period != 'All Time' else 0
+                if period == 'Daily':
+                    if (day.year, day.month, day.day) != (year, int(self.date_vars[(period, 'month')].get()), int(self.date_vars[(period, 'day')].get())): continue
+                    key = f'{stamp.hour:02d}:00'
+                elif period == 'Weekly':
+                    iso = day.isocalendar()
+                    if (iso.year, iso.week) != (year, int(self.date_vars[(period, 'week')].get())):continue
+                    key = f'{day.isoweekday()} {day.strftime("%a")}'
+                elif period == 'Monthly':
+                    if (day.year, day.month) != (year, int(self.date_vars[(period, 'month')].get())):continue
+                    key = f'{day.day:02d}'
+                elif period == 'Yearly':
+                    if day.year != year:continue
+                    key = f'{day.month:02d}'
+                else:
+                    key = day.strftime('%Y-%m')
+                selected.append(r)
+                buckets[key] = buckets.get(key, 0.0) + r['pnl']
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if period == 'Daily': keys=[f'{x:02d}:00' for x in range(24)]
+        elif period == 'Weekly': keys=[f'{i} {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][i-1]}' for i in range(1,8)]
+        elif period == 'Monthly':
+            import calendar
+            try: count=calendar.monthrange(int(self.date_vars[(period,'year')].get()),int(self.date_vars[(period,'month')].get()))[1]
+            except ValueError: count=31
+            keys=[f'{x:02d}' for x in range(1,count+1)]
+        elif period == 'Yearly': keys=[f'{x:02d}' for x in range(1,13)]
+        else:keys=sorted(buckets)
+        return selected, keys, [buckets.get(k,0.0) for k in keys]
+
+    def draw_period(self, period):
+        if not hasattr(self, 'period_canvases') or period not in self.period_canvases:return
+        c=self.period_canvases[period]
+        c.delete('all')
+        w,h=c.winfo_width(),c.winfo_height()
+        if w < 100 or h < 100:return
+        rows, labels, values=self.period_data(period)
+        cumulative=[]
+        total=0.0
+        for v in values:
+            total+=v
+            cumulative.append(total)
+        kind=self.date_vars[(period,'chart')].get()
+        title=f'{period.upper()}  /  {kind.upper()}  /  REALIZED NET P&L'
+        c.create_text(24,23,text=title,anchor='w',fill=TEXT,font=('Segoe UI Semibold',14))
+        pad_l,pad_r,pad_top,pad_bottom=70,30,55,63
+        if not labels:
+            c.create_text(w/2,h/2,text='No closed trades for this period',fill=MUTED,font=('Segoe UI',13))
+            return
+        # Bar chart shows P&L of each bucket; line and area show cumulative P&L.
+        series = values if kind=='Bar' else cumulative
+        lo=min([0]+series);hi=max([0]+series)
+        if lo==hi:lo-=1;hi+=1
+        margin=(hi-lo)*.10
+        lo-=margin;hi+=margin
+        plot_w=max(10,w-pad_l-pad_r);plot_h=max(10,h-pad_top-pad_bottom)
+        def xx(i):return pad_l+(i+.5)*plot_w/max(1,len(labels))
+        def yy(v):return pad_top+(hi-v)*plot_h/(hi-lo)
+        for j in range(5):
+            v=lo+(hi-lo)*j/4;y=yy(v)
+            c.create_line(pad_l,y,w-pad_r,y,fill='#344052',dash=(3,5))
+            c.create_text(pad_l-10,y,text=f'{v:,.0f}',anchor='e',fill=MUTED)
+        zero=yy(0)
+        if kind=='Bar':
+            width=max(2,min(48,plot_w/max(1,len(labels))*.72))
+            for i,v in enumerate(values):
+                x=xx(i);y=yy(v)
+                c.create_rectangle(x-width/2,min(y,zero),x+width/2,max(y,zero)+1,fill=GREEN if v>=0 else RED,outline='')
+        else:
+            points=[]
+            for i,v in enumerate(series):points.extend([xx(i),yy(v)])
+            if kind=='Area' and len(points)>=4:
+                c.create_polygon([xx(0),zero]+points+[xx(len(series)-1),zero],fill='#245483',outline='')
+            if len(points)>=4:c.create_line(*points,fill=GREEN if total>=0 else RED,width=3)
+            elif len(points)==2:c.create_oval(points[0]-3,points[1]-3,points[0]+3,points[1]+3,fill=GREEN,outline='')
+        stride=max(1,(len(labels)+11)//12)
+        for i,label in enumerate(labels):
+            if i%stride==0 or i==len(labels)-1:c.create_text(xx(i),h-42,text=label,fill=MUTED,font=('Segoe UI',9))
+        c.create_text(w-pad_r,h-15,anchor='e',text=f'{len(rows)} closed trades  â€¢  Net P&L: {sum(values):+,.2f}',fill=TEXT)
 
     def _make_history(self):
         bar = ttk.Frame(self.history)
@@ -187,7 +323,7 @@ class App(tk.Tk):
         actions.pack(fill='x', pady=14)
         ttk.Button(actions, text='Save Trade', style='Accent.TButton', command=self.save_trade).pack(side='left', padx=3)
         ttk.Button(actions, text='Clear / New', command=self.new_trade).pack(side='left', padx=3)
-        ttk.Label(right, text='CHART EVIDENCE  •  BEFORE / AFTER', font=('Segoe UI Semibold', 17)).pack(anchor='w', pady=(0, 6))
+        ttk.Label(right, text='CHART EVIDENCE  â€¢  BEFORE / AFTER', font=('Segoe UI Semibold', 17)).pack(anchor='w', pady=(0, 6))
         ttk.Label(right, text='Six chart slots per trade. Choose an image or paste a screenshot from the clipboard.', style='Muted.TLabel').pack(anchor='w', pady=(0, 12))
         grid = ttk.Frame(right)
         grid.pack(fill='both', expand=True)
@@ -216,52 +352,28 @@ class App(tk.Tk):
 
     def refresh(self):
         self.load_history()
-        rows = [r for r in self._all_trades() if r['pnl'] is not None]
+        period = self.period_tabs.tab(self.period_tabs.select(), 'text') if hasattr(self,'period_tabs') else 'All Time'
+        rows = self.period_data(period)[0] if hasattr(self,'date_vars') else [r for r in self._all_trades() if r['pnl'] is not None]
         pnls = [r['pnl'] for r in rows]
         wins = [x for x in pnls if x > 0]
         losses = [x for x in pnls if x < 0]
         grosswin = sum(wins)
         grossloss = abs(sum(losses))
-        equity = 0.0
-        peak = 0.0
-        maxdd = 0.0
+        equity = peak = maxdd = 0.0
         for x in pnls:
             equity += x
             peak = max(peak, equity)
             maxdd = max(maxdd, peak - equity)
         stats = {
-            'Total Trades': str(len(self._all_trades())),
-            'Win Rate': f'{len(wins)/len(pnls)*100:.1f}%' if pnls else '—',
+            'Total Trades': str(len(rows)),
+            'Win Rate': f'{len(wins)/len(pnls)*100:.1f}%' if pnls else 'â€”',
             'Net P&L': f'{sum(pnls):+,.2f}',
-            'Profit Factor': f'{grosswin/grossloss:.2f}' if grossloss else ('∞' if grosswin else '—'),
-            'Avg Win / Loss': f'{grosswin/len(wins):,.2f} / {grossloss/len(losses):,.2f}' if wins and losses else '—',
+            'Profit Factor': f'{grosswin/grossloss:.2f}' if grossloss else ('âˆž' if grosswin else 'â€”'),
+            'Avg Win / Loss': f'{grosswin/len(wins):,.2f} / {grossloss/len(losses):,.2f}' if wins and losses else 'â€”',
             'Max Drawdown': f'{maxdd:,.2f}' }
         for name, val in stats.items():self.stats[name].config(text=val)
-        self.draw_equity()
-
-    def draw_equity(self):
-        if not hasattr(self, 'graph'):return
-        c = self.graph
-        c.delete('all')
-        w,h = c.winfo_width(),c.winfo_height()
-        if w<60 or h<60:return
-        pnls = [r['pnl'] for r in self._all_trades() if r['pnl'] is not None]
-        totals=[0.0]
-        for p in pnls:totals.append(totals[-1]+p)
-        low,high=min(totals),max(totals)
-        if high==low:high+=1;low-=1
-        pad=65
-        def xy(i,n):return (pad+i*(w-2*pad)/max(1,len(totals)-1), h-pad-(n-low)*(h-2*pad)/(high-low))
-        c.create_text(24,20,text='EQUITY CURVE  /  REALIZED P&L',anchor='w',fill=TEXT,font=('Segoe UI Semibold',14))
-        for j in range(5):
-            v=low+(high-low)*j/4
-            y=xy(0,v)[1]
-            c.create_line(pad,y,w-pad,y,fill='#344052',dash=(3,5))
-            c.create_text(pad-8,y,text=f'{v:,.0f}',anchor='e',fill=MUTED)
-        points=[]
-        for i, v in enumerate(totals):points.extend(xy(i,v))
-        if len(points)>2:c.create_line(*points,fill=GREEN if totals[-1]>=0 else RED,width=3,smooth=False)
-        c.create_text(w-pad,h-24,text=f'{len(pnls)} closed trades',anchor='e',fill=MUTED)
+        if hasattr(self,'period_canvases'):
+            for p in self.period_canvases:self.draw_period(p)
 
     def load_history(self):
         if not hasattr(self,'tree'):return
@@ -444,37 +556,62 @@ class App(tk.Tk):
     def restore(self):
         archive=filedialog.askopenfilename(filetypes=[('ZIP archive','*.zip')])
         if not archive:return
-        if not messagebox.askyesno('Restore backup','This will replace all CURRENT journal data and images. Make a backup first. Continue?'):return
-        with zipfile.ZipFile(archive) as z:
-            names=z.namelist()
-            if 'journal.sqlite3' not in names:return messagebox.showerror('Invalid backup','Missing journal.sqlite3')
-            if any(n.startswith('/') or '..' in Path(n).parts for n in names):return messagebox.showerror('Invalid archive','Unsafe file path.')
-            raw=z.read('journal.sqlite3')
-            tmp=BASE/'restore_temp.sqlite3';tmp.write_bytes(raw)
+        if not messagebox.askyesno('Restore backup','This replaces the current journal and images. Please keep a separate backup first. Continue?'):return
+        staging=BASE/f'_restore_{uuid.uuid4().hex}'
+        staging.mkdir()
+        old_db=BASE/f'_old_{uuid.uuid4().hex}.sqlite3'
+        old_images=BASE/f'_old_images_{uuid.uuid4().hex}'
+        try:
+            with zipfile.ZipFile(archive) as z:
+                names=z.namelist()
+                if 'journal.sqlite3' not in names:raise ValueError('Not a Layaq backup: journal.sqlite3 is missing.')
+                if any(n.startswith('/') or '\\' in n or '..' in Path(n).parts for n in names):raise ValueError('Unsafe file path in archive.')
+                if z.testzip() is not None:raise ValueError('Backup ZIP contains a corrupted file.')
+                staged_db=staging/'journal.sqlite3'
+                staged_db.write_bytes(z.read('journal.sqlite3'))
+                image_dir=staging/'images';image_dir.mkdir()
+                for n in names:
+                    if n.startswith('images/') and not n.endswith('/'):
+                        if Path(n).name != n[7:]:raise ValueError('Unexpected nested screenshot path.')
+                        (image_dir/Path(n).name).write_bytes(z.read(n))
+            # Verify the backup before touching any active journal files.
+            with sqlite3.connect(staged_db) as restored:
+                if restored.execute('PRAGMA integrity_check').fetchone()[0]!='ok':raise ValueError('Database integrity check failed.')
+                tables={r[0] for r in restored.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {'trades','trade_images'}.issubset(tables):raise ValueError('Not a compatible Layaq journal backup.')
+                for tid,slot,old_path in restored.execute('SELECT trade_id,slot,path FROM trade_images').fetchall():
+                    filename=Path(str(old_path).replace('\\','/')).name
+                    if not (image_dir/filename).is_file():raise ValueError(f'Backup missing screenshot: {filename}')
+                    restored.execute('UPDATE trade_images SET path=? WHERE trade_id=? AND slot=?',(str(IMAGES/filename),tid,slot))
+                restored.commit()
+                # WAL -> DELETE: guarantees a single self-contained database file.
+                restored.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                restored.execute('PRAGMA journal_mode=DELETE')
+            # SQLite connection from connect() uses WAL; checkpoint and close before swapping.
+            with connect() as current:current.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            if DB.exists():shutil.copy2(DB,old_db)
+            shutil.copytree(IMAGES,old_images)
             try:
-                check=sqlite3.connect(tmp)
-                ok=check.execute('PRAGMA integrity_check').fetchone()[0]
-                check.close()
-                if ok!='ok':raise ValueError(ok)
-                # Backup archives may be restored on a different Windows PC.
-                with sqlite3.connect(tmp) as restored:
-                    for slot_row in restored.execute('SELECT trade_id,slot,path FROM trade_images').fetchall():
-                        tid,slot,old_path=slot_row
-                        new_path=str(IMAGES/Path(old_path.replace('\\','/')).name)
-                        restored.execute('UPDATE trade_images SET path=? WHERE trade_id=? AND slot=?',(new_path,tid,slot))
-                for p in IMAGES.glob('*'):
-                    if p.is_file():p.unlink()
-                for name in names:
-                    if name.startswith('images/') and not name.endswith('/'):
-                        p=IMAGES/Path(name).name
-                        p.write_bytes(z.read(name))
-                for f in (Path(str(DB)+'-wal'),Path(str(DB)+'-shm')):f.unlink(missing_ok=True)
-                os.replace(tmp,DB)
-            except Exception as e:
-                tmp.unlink(missing_ok=True)
-                return messagebox.showerror('Restore failed',str(e))
-        self.new_trade();self.refresh()
-        messagebox.showinfo('Restored','Backup restored successfully.')
+                os.replace(staged_db,DB)
+                for sidecar in ('-wal','-shm'):Path(str(DB)+sidecar).unlink(missing_ok=True)
+                for f in IMAGES.iterdir():
+                    if f.is_file():f.unlink()
+                for f in image_dir.iterdir():shutil.copy2(f,IMAGES/f.name)
+                setup()
+            except Exception:
+                if old_db.exists():os.replace(old_db,DB)
+                if old_images.exists():
+                    shutil.rmtree(IMAGES,ignore_errors=True)
+                    shutil.copytree(old_images,IMAGES)
+                raise
+            self.new_trade();self.refresh()
+            messagebox.showinfo('Restored','Your trades and all six screenshot slots were restored successfully.')
+        except Exception as e:
+            messagebox.showerror('Restore failed',str(e))
+        finally:
+            shutil.rmtree(staging,ignore_errors=True)
+            old_db.unlink(missing_ok=True)
+            shutil.rmtree(old_images,ignore_errors=True)
 
 if __name__=='__main__':
     App().mainloop()
