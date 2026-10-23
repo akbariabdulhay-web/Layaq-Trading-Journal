@@ -100,6 +100,24 @@ def setup():
             if name not in existing:
                 typ = 'TEXT' if name in ('plan_followed', 'setup_grade') else 'REAL'
                 cn.execute(f'ALTER TABLE trades ADD COLUMN {name} {typ}')
+        # Existing records are migrated into a default account without changing their IDs.
+        cn.execute('''CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'Demo',
+            starting_balance REAL NOT NULL DEFAULT 0, funded INTEGER NOT NULL DEFAULT 0,
+            rules_json TEXT NOT NULL DEFAULT '[]', checks_json TEXT NOT NULL DEFAULT '{}')''')
+        try:
+            legacy_capital=float(get_preferences().get('starting_balance') or 0)
+        except (ValueError,TypeError):
+            legacy_capital=0
+        cn.execute("INSERT OR IGNORE INTO accounts(id,name,provider,kind,starting_balance,funded) VALUES (1,'My First Account','','Demo',?,0)", (legacy_capital,))
+        acct_fields={r[1] for r in cn.execute('PRAGMA table_info(accounts)')}
+        for col in ('daily_loss_limit','max_loss_limit','profit_target'):
+            if col not in acct_fields: cn.execute(f'ALTER TABLE accounts ADD COLUMN {col} REAL NOT NULL DEFAULT 0')
+        fields={r[1] for r in cn.execute('PRAGMA table_info(trades)')}
+        if 'account_id' not in fields:
+            cn.execute('ALTER TABLE trades ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1')
+        cn.execute('CREATE INDEX IF NOT EXISTS ix_trades_account ON trades(account_id)')
         cn.execute('CREATE INDEX IF NOT EXISTS ix_trades_date ON trades(date)')
         cn.execute('CREATE INDEX IF NOT EXISTS ix_trades_symbol ON trades(symbol)')
 
@@ -449,6 +467,9 @@ class App(tk.Tk):
         self.trade_id = None
         self.pending_images = {}
         self.active_preview = None
+        self.account_id = 1
+        self.account_name_var = tk.StringVar()
+        self._load_account_selection()
         self._layout()
         self.refresh()
 
@@ -484,6 +505,210 @@ class App(tk.Tk):
         rec=auth_record()
         self.security_status.set('Login password: '+('ON' if rec.get('enabled',True) else 'OFF'))
 
+    def _load_account_selection(self):
+        with connect() as cn:
+            row = cn.execute('SELECT id,name FROM accounts ORDER BY id LIMIT 1').fetchone()
+        if row:
+            self.account_id = row['id']
+            self.account_name_var.set(row['name'])
+
+    def _update_account_picker(self):
+        if not hasattr(self, 'account_picker'): return
+        with connect() as cn:
+            rows=cn.execute('SELECT id,name FROM accounts ORDER BY id').fetchall()
+        self._account_options={r['name']:r['id'] for r in rows}
+        self.account_picker['values']=list(self._account_options)
+        chosen=next((r['name'] for r in rows if r['id']==self.account_id), rows[0]['name'] if rows else '')
+        self.account_name_var.set(chosen)
+
+    def _switch_account(self,event=None):
+        selected=self._account_options.get(self.account_name_var.get())
+        if selected is None or selected==self.account_id: return
+        self.account_id=selected
+        # An unsaved editor is cleared, never silently reassigned to another account.
+        self.new_trade()
+        if hasattr(self,'start_balance_var'):
+            self.start_balance_var.set(f'{self._starting_balance():.2f}')
+        self._load_account_editor()
+        self.refresh()
+        self.notify('Active account: '+self.account_name_var.get())
+
+    def _account_row(self):
+        with connect() as cn:
+            return cn.execute('SELECT * FROM accounts WHERE id=?',(self.account_id,)).fetchone()
+
+    def _make_accounts(self):
+        outer=ttk.Frame(self.accounts_tab)
+        outer.pack(fill='both', expand=True, padx=30, pady=20)
+        ttk.Label(outer,text='MULTI-ACCOUNT WORKSPACE',font=('Segoe UI Semibold',22)).pack(anchor='w',pady=(0,8))
+        ttk.Label(outer,text='Independent portfolios • numeric funded risk limits • per-account performance').pack(anchor='w',pady=(0,12))
+        self.all_accounts_summary=ttk.Label(outer,text='',font=('Segoe UI Semibold',13))
+        self.all_accounts_summary.pack(anchor='w',pady=(0,12))
+        add=ttk.LabelFrame(outer,text='Add Account',padding=15)
+        add.pack(fill='x',pady=8)
+        self.new_acct_name=tk.StringVar()
+        self.new_acct_provider=tk.StringVar()
+        self.new_acct_kind=tk.StringVar(value='Demo')
+        self.new_acct_capital=tk.StringVar(value='10000')
+        row=ttk.Frame(add);row.pack(fill='x')
+        for title,var,width in [('Account name',self.new_acct_name,24),('Provider',self.new_acct_provider,21),('Starting balance (USD)',self.new_acct_capital,15)]:
+            cell=ttk.Frame(row);cell.pack(side='left',padx=(0,12))
+            ttk.Label(cell,text=title).pack(anchor='w')
+            ttk.Entry(cell,textvariable=var,width=width).pack()
+        ttk.Label(add,text='Account type').pack(anchor='w',pady=(8,2))
+        for opt in ('Demo','Personal Live','Funded Evaluation','Funded Live'):
+            ttk.Radiobutton(add,text=opt,value=opt,variable=self.new_acct_kind).pack(side='left',padx=5)
+        ttk.Button(add,text='+ Create Account',command=self._add_account).pack(side='right')
+        box=ttk.LabelFrame(outer,text='Selected Account • Funded Rules',padding=16)
+        box.pack(fill='both',expand=True,pady=12)
+        self.current_acct_title=ttk.Label(box,text='',font=('Segoe UI Semibold',16))
+        self.current_acct_title.pack(anchor='w',pady=4)
+        ttk.Label(box,text='Realized P&L risk limits (USD). 0 disables a limit. Set values from your provider contract.').pack(anchor='w')
+        cfg=ttk.Frame(box);cfg.pack(fill='x',pady=8)
+        self.limit_vars={}
+        for key,label in [('daily_loss_limit','Max daily loss ($)'),('max_loss_limit','Max total loss ($)'),('profit_target','Profit target ($)')]:
+            f=ttk.Frame(cfg);f.pack(side='left',padx=(0,16))
+            ttk.Label(f,text=label).pack(anchor='w')
+            v=tk.StringVar(value='0');self.limit_vars[key]=v
+            ttk.Entry(f,textvariable=v,width=16).pack()
+        ttk.Button(box,text='Save Risk Limits',command=self._save_risk_limits).pack(anchor='w',pady=5)
+        self.risk_bars=ttk.Frame(box);self.risk_bars.pack(fill='x',pady=10)
+        ttk.Label(box,text='Additional provider-specific rules (notes only; not automatically enforced):').pack(anchor='w')
+        self.rules_text=tk.Text(box,height=4,wrap='word',bg=ENTRY,fg=TEXT,insertbackground=TEXT)
+        self.rules_text.pack(fill='x',pady=6)
+        ttk.Button(box,text='Save Rule Notes',command=self._save_account_rules).pack(anchor='w')
+        self.rule_status_frame=ttk.Frame(box)  # compatibility with older saved rule notes
+        self.rule_progress=ttk.Label(box,text='')
+        ttk.Label(box,text='Limits use CLOSED trades only, based on the saved trade timestamp; intraday floating equity and broker enforcement are not available.',style='Muted.TLabel').pack(anchor='w',pady=8)
+        self._load_account_editor()
+
+
+    def _add_account(self):
+        name=self.new_acct_name.get().strip()
+        if not name:return self.notify('Enter an account name.','error')
+        try:
+            capital=float(self.new_acct_capital.get().replace(',',''))
+            if not (0<=capital<1e15): raise ValueError
+        except ValueError:return self.notify('Invalid starting balance.','error')
+        kind=self.new_acct_kind.get()
+        try:
+            with connect() as cn:
+                cur=cn.execute('INSERT INTO accounts(name,provider,kind,starting_balance,funded) VALUES(?,?,?,?,?)',
+                    (name,self.new_acct_provider.get().strip(),kind,capital,int('Funded' in kind)))
+                aid=cur.lastrowid
+        except sqlite3.IntegrityError:return self.notify('Account name already exists.','error')
+        self.account_id=aid
+        self._update_account_picker()
+        self.start_balance_var.set(f'{capital:.2f}')
+        self._load_account_editor()
+        self.new_trade()
+        self.refresh()
+        self.tabs.select(self.accounts_tab)
+        self.notify('Account created: '+name)
+
+    def _load_account_editor(self):
+        if not hasattr(self,'rules_text'): return
+        row=self._account_row()
+        if not row:return
+        self.current_acct_title.config(text=f"{row['name']}  |  {row['provider']}  |  {row['kind']}")
+        try:rules=json.loads(row['rules_json'] or '[]')
+        except ValueError:rules=[]
+        try:checks=json.loads(row['checks_json'] or '{}')
+        except ValueError:checks={}
+        self.rules_text.delete('1.0','end');self.rules_text.insert('1.0','\n'.join(rules))
+        for key,v in self.limit_vars.items():v.set(f"{float(row[key] or 0):g}")
+        self._render_risk_bars()
+
+    def _risk_state(self, candidate=None, exclude_id=None):
+        row=self._account_row()
+        if row is None:return {'locked':False,'balance':0,'reason':'','daily':0,'total_loss':0,'profit':0}
+        start=float(row['starting_balance'] or 0)
+        with connect() as cn:
+            trades=[(r['date'],float(r['pnl'])) for r in cn.execute('SELECT id,date,pnl FROM trades WHERE account_id=? AND pnl IS NOT NULL',(self.account_id,)) if r['id']!=exclude_id]
+        if candidate and candidate[1] is not None: trades.append(candidate)
+        trades.sort(key=lambda x:x[0]);pnl=sum(x[1] for x in trades)
+        bal=start+pnl
+        daily=defaultdict(float)
+        for when,value in trades: daily[when[:10]]+=value
+        max_daily=max((max(0,-v) for v in daily.values()),default=0)
+        daily_limit=float(row['daily_loss_limit'] or 0)
+        max_limit=float(row['max_loss_limit'] or 0)
+        max_loss=max(0,-pnl)
+        reason=''
+        if row['funded']:
+            if daily_limit>0 and max_daily>=daily_limit-1e-8:reason='Daily loss limit breached'
+            if max_limit>0 and max_loss>=max_limit-1e-8:reason='Maximum loss limit breached'
+            # Lack of equity history means trailing and floating limits cannot be proven.
+        elif row['kind']=='Personal Live' and bal<=0:reason='Live account balance is zero or negative'
+        return dict(locked=bool(reason),reason=reason,balance=bal,daily=max_daily,total_loss=max_loss,profit=max(0,pnl),daily_limit=daily_limit,max_limit=max_limit,target=float(row['profit_target'] or 0))
+
+    def _save_risk_limits(self):
+        nums={}
+        for k,v in self.limit_vars.items():
+            try:
+                val=float(v.get().strip().replace(',',''))
+                if not (0<=val<=1e12):raise ValueError
+            except ValueError:return self.notify('Enter valid nonnegative numeric risk limits.','error')
+            nums[k]=val
+        with connect() as cn:
+            cn.execute('UPDATE accounts SET daily_loss_limit=?, max_loss_limit=?, profit_target=? WHERE id=?',
+                (nums['daily_loss_limit'],nums['max_loss_limit'],nums['profit_target'],self.account_id))
+        self._render_risk_bars();self.notify('Account risk limits saved.')
+
+    def _render_risk_bars(self):
+        if not hasattr(self,'risk_bars'):return
+        for c in self.risk_bars.winfo_children():c.destroy()
+        state=self._risk_state()
+        for label,amount,limit,is_risk in [('Daily loss used',state['daily'],state['daily_limit'],True),('Total loss used',state['total_loss'],state['max_limit'],True),('Profit target',state['profit'],state['target'],False)]:
+            if limit<=0:continue
+            frac=max(0,min(1,amount/limit))
+            frame=ttk.Frame(self.risk_bars);frame.pack(fill='x',pady=6)
+            ttk.Label(frame,text=f'{label}: ${amount:,.2f} / ${limit:,.2f}  ({100*frac:.1f}%)').pack(anchor='w')
+            canvas=tk.Canvas(frame,height=17,bg=ENTRY,highlightthickness=0)
+            canvas.pack(fill='x')
+            color=(RED if frac>=1 or (is_risk and frac>=.8) else (GREEN if not is_risk else ACCENT))
+            def paint(event,c=canvas,f=frac,col=color):
+                c.delete('all');c.create_rectangle(0,0,event.width*f,17,fill=col,outline='')
+            canvas.bind('<Configure>',paint)
+        if state['locked']:
+            ttk.Label(self.risk_bars,text='ACCOUNT LOCKED — '+state['reason'],foreground=RED).pack(anchor='w')
+        if hasattr(self,'all_accounts_summary'):
+            with connect() as cn:
+                r=cn.execute('SELECT COUNT(*),SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),SUM(pnl) FROM trades WHERE pnl IS NOT NULL').fetchone()
+            total=r[0] or 0;wins=r[1] or 0
+            self.all_accounts_summary.config(text=f'ALL ACCOUNTS | Closed trades: {total} | Win rate: {100*wins/total:.1f}% | Net P&L: ${float(r[2] or 0):+,.2f}' if total else 'ALL ACCOUNTS | No closed trades')
+
+    def _save_account_rules(self):
+        rules=list(dict.fromkeys(line.strip() for line in self.rules_text.get('1.0','end').splitlines() if line.strip()))
+        if len(rules)>50:return self.notify('Limit rules to 50 per account.','error')
+        checks={r:bool(self.rule_vars[r].get()) if r in getattr(self,'rule_vars',{}) else False for r in rules}
+        with connect() as cn:
+            cn.execute('UPDATE accounts SET rules_json=?,checks_json=? WHERE id=?',
+                (json.dumps(rules),json.dumps(checks),self.account_id))
+        self._load_account_editor()
+        self.notify('Rule notes saved for selected account.')
+
+    def _save_checklist(self):
+        pass  # Legacy checkboxes are replaced by numeric progress bars.
+
+    def _starting_balance(self):
+        row=self._account_row()
+        return float(row['starting_balance'] or 0) if row else 0.0
+
+    def _save_starting_balance(self):
+        raw = self.start_balance_var.get().strip().replace(',', '')
+        try:
+            amount = float(raw)
+            if not (0 < amount < 1e15) or not __import__('math').isfinite(amount):
+                raise ValueError
+        except (TypeError, ValueError):
+            self.notify('Enter a valid starting balance greater than $0.', kind='error')
+            return
+        with connect() as cn:
+            cn.execute('UPDATE accounts SET starting_balance=? WHERE id=?',(amount,self.account_id))
+        self.notify(f'Starting account balance saved: ${amount:,.2f}')
+        self.refresh()
+
     def _make_settings(self):
         box=tk.Frame(self.settings_tab,bg=PANEL,padx=24,pady=24)
         box.pack(anchor='nw',fill='x',padx=25,pady=25)
@@ -493,6 +718,16 @@ class App(tk.Tk):
         for mode in ('Dark','Light'):
             ttk.Radiobutton(theme_row,text=mode,value=mode,variable=self.theme_mode,
                             command=self._change_theme).pack(side='left',padx=8)
+        ttk.Label(box, text='ACCOUNT CAPITAL  /  USD', font=('Segoe UI Semibold', 17)).pack(anchor='w', pady=(4, 8))
+        ttk.Label(box, text='Enter the starting amount in your trading account. This does not change trade P&L.',
+                  style='Muted.TLabel').pack(anchor='w', pady=(0, 6))
+        capital_row = ttk.Frame(box)
+        capital_row.pack(fill='x', pady=(0, 16))
+        self.start_balance_var = tk.StringVar(value=f'{self._starting_balance():.2f}')
+        ttk.Entry(capital_row, textvariable=self.start_balance_var, width=24).pack(side='left', padx=(0, 10))
+        ttk.Button(capital_row, text='Save Starting Balance', command=self._save_starting_balance).pack(side='left')
+        ttk.Label(box, text='Estimated balance = starting capital + realized net P&L. Deposits, withdrawals, and open trades are not included.',
+                  style='Muted.TLabel').pack(anchor='w', pady=(0, 12))
         ttk.Label(box,text='Security settings',font=('Segoe UI Semibold',19)).pack(anchor='w',pady=(0,10))
         self.security_status=tk.StringVar()
         ttk.Label(box,textvariable=self.security_status).pack(anchor='w',pady=8)
@@ -697,7 +932,13 @@ class App(tk.Tk):
         self._add_logo(header, 48, BG, side='left')
         tk.Label(header, text='LAYAQ  /  TRADING JOURNAL', font=('Segoe UI Semibold', 23), bg=BG, fg=TEXT).pack(side='left')
         tk.Label(header, text='SUPER APP   •   OFFLINE', font=('Segoe UI', 10), bg=BG, fg=GREEN).pack(side='left', padx=18)
-        ttk.Button(header, text='Save Trade', style='Accent.TButton', command=self.save_trade).pack(side='right', padx=4)
+        ttk.Label(header, text='ACCOUNT').pack(side='left', padx=(14, 5))
+        self.account_picker = ttk.Combobox(header, state='readonly', textvariable=self.account_name_var, width=24)
+        self.account_picker.pack(side='left', padx=4)
+        self.account_picker.bind('<<ComboboxSelected>>', self._switch_account)
+        self._update_account_picker()
+        ttk.Button(header, text='+ Add Account', command=lambda: self.tabs.select(self.accounts_tab)).pack(side='left', padx=5)
+        ttk.Button(header, text='Save Trade' , style='Accent.TButton', command=self.save_trade).pack(side='right', padx=4)
         ttk.Button(header, text='+ New Trade', style='Accent.TButton', command=self.new_trade).pack(side='right', padx=4)
         ttk.Button(header, text='Backup', command=self.backup).pack(side='right', padx=4)
         ttk.Button(header, text='Restore', command=self.restore).pack(side='right', padx=4)
@@ -717,11 +958,14 @@ class App(tk.Tk):
         self.tabs.add(self.editor, text='Trade Editor & Charts')
         self.tabs.add(self.calendar_tab, text='Trading Calendar')
         self.tabs.add(self.analytics_tab, text='Advanced Analytics')
+        self.accounts_tab = ttk.Frame(self.tabs)
+        self.tabs.add(self.accounts_tab, text='Accounts & Funded Rules')
         self.tabs.add(self.settings_tab, text='Settings')
         self._make_dashboard()
         self._make_history()
         self._make_editor()
         self._make_settings()
+        self._make_accounts()
         self._make_calendar()
         self._make_analytics()
         self.tabs.bind('<<NotebookTabChanged>>', self._on_tab_change)
@@ -786,7 +1030,7 @@ class App(tk.Tk):
         self.stats_frame = ttk.Frame(self.dashboard)
         self.stats_frame.pack(fill='x', pady=(12, 12))
         self.stats = {}
-        for name in ('Total Trades', 'Win Rate', 'Net P&L', 'Profit Factor', 'Avg Win / Loss', 'Max Drawdown'):
+        for name in ('Starting Balance', 'Est. Current Balance', 'Total Trades', 'Win Rate', 'Net P&L', 'Profit Factor', 'Avg Win / Loss', 'Max Drawdown'):
             box = tk.Frame(self.stats_frame, bg=PANEL, padx=13, pady=12)
             box.pack(side='left', fill='both', expand=True, padx=5)
             tk.Label(box, text=name, bg=PANEL, fg=MUTED).pack(anchor='w')
@@ -1178,7 +1422,7 @@ class App(tk.Tk):
             self.analytics_tables[name] = tree
             tables.grid_columnconfigure(index, weight=1)
         tables.grid_rowconfigure(0, weight=1)
-        ttk.Label(outer, text='Calculated from closed trades. Drawdown % is unavailable without a starting account balance; '
+        ttk.Label(outer, text='Calculated from closed trades. Set starting balance in Settings to calculate Drawdown %. '
                   'a cash drawdown is shown instead. Date filters use the computer’s local dates.',
                   style='Muted.TLabel', wraplength=1100).pack(anchor='w', pady=(12, 0))
 
@@ -1212,10 +1456,22 @@ class App(tk.Tk):
         avgwin = sum(wins)/len(wins) if wins else 0
         avgloss = abs(sum(losses))/len(losses) if losses else 0
         factor = sum(wins)/abs(sum(losses)) if losses else None
+        # Calculate percentage peak-to-trough drawdown from a real starting balance,
+        # not from an arbitrary zero equity. The report is over closed trades only.
+        capital = self._starting_balance()
+        account = capital
+        running_peak = capital
+        worst_drawdown_pct = 0.0
+        if capital > 0:
+            for pnl in vals:
+                account += pnl
+                running_peak = max(running_peak, account)
+                if running_peak > 0:
+                    worst_drawdown_pct = max(worst_drawdown_pct, (running_peak-account)/running_peak*100)
         report = {
             'Total Trades':str(len(vals)), 'Net P&L':f'{sum(vals):+,.2f}',
             'Expectancy': f'{sum(vals)/len(vals):+,.2f}' if vals else '—',
-            'Max Drawdown':f'{dd:,.2f}', 'Max DD %':'N/A',
+            'Max Drawdown':f'{dd:,.2f}', 'Max DD %':f'{worst_drawdown_pct:.2f}%' if capital else 'Set starting balance',
             'Win Rate':f'{100*len(wins)/len(vals):.1f}%' if vals else '—',
             'Avg Win':f'{avgwin:+,.2f}' if wins else '—',
             'Avg Loss':f'{-avgloss:,.2f}' if losses else '—',
@@ -1418,7 +1674,7 @@ class App(tk.Tk):
 
     def _all_trades(self):
         with connect() as cn:
-            return cn.execute('SELECT * FROM trades ORDER BY date, id').fetchall()
+            return cn.execute('SELECT * FROM trades WHERE account_id=? ORDER BY date, id',(self.account_id,)).fetchall()
 
     def refresh(self):
         self.load_history()
@@ -1443,7 +1699,13 @@ class App(tk.Tk):
             'Profit Factor': f'{grosswin/grossloss:.2f}' if grossloss else ('∞' if grosswin else '—'),
             'Avg Win / Loss': f'{grosswin/len(wins):,.2f} / {grossloss/len(losses):,.2f}' if wins and losses else '—',
             'Max Drawdown': f'{maxdd:,.2f}' }
-        for name, val in stats.items():self.stats[name].config(text=val)
+        capital = self._starting_balance()
+        all_pnl = sum(float(r['pnl']) for r in self._all_trades() if r['pnl'] is not None)
+        stats['Starting Balance'] = f'${capital:,.2f}' if capital else 'Not set'
+        stats['Est. Current Balance'] = f'${capital + all_pnl:,.2f}' if capital else 'Set balance first'
+        for name, val in stats.items():
+            self.stats[name].config(text=val,fg=RED if name=='Net P&L' and sum(pnls)<0 else GREEN if name=='Net P&L' and sum(pnls)>0 else TEXT)
+        if hasattr(self,'risk_bars'): self._render_risk_bars()
         if hasattr(self,'period_canvases'):
             for p in self.period_canvases:self.draw_period(p)
 
@@ -1451,7 +1713,7 @@ class App(tk.Tk):
         if not hasattr(self,'tree'):return
         q=self.search_var.get().lower().strip()
         with connect() as cn:
-            rows=cn.execute('SELECT * FROM trades ORDER BY id DESC').fetchall()
+            rows=cn.execute('SELECT * FROM trades WHERE account_id=? ORDER BY id DESC',(self.account_id,)).fetchall()
         rows=[r for r in rows if q in ' '.join(str(r[k] or '') for k in ('id','date','symbol','market','side','session','strategy','emotion','plan_followed')).lower()]
         plan_filter = self.history_plan_filter.get()
         if plan_filter != 'All':
@@ -1494,9 +1756,9 @@ class App(tk.Tk):
 
     def load_trade(self,trade_id):
         with connect() as cn:
-            row=cn.execute('SELECT * FROM trades WHERE id=?',(trade_id,)).fetchone()
+            row=cn.execute('SELECT * FROM trades WHERE id=? AND account_id=?',(trade_id,self.account_id)).fetchone()
             images=cn.execute('SELECT slot,path FROM trade_images WHERE trade_id=?',(trade_id,)).fetchall()
-        if not row:return
+        if not row:return self.notify('Trade does not belong to selected account.','error')
         self.trade_id=trade_id
         for k,v in self.fields.items():
             raw = ('Not Marked' if k == 'plan_followed' else 'Not Graded' if k == 'setup_grade' else '') if row[k] is None else str(row[k])
@@ -1527,13 +1789,19 @@ class App(tk.Tk):
             values['setup_grade'] = None
         values['setup']=self.setup_note.get('1.0','end').strip()
         values['review']=self.review_note.get('1.0','end').strip()
+        current_state=self._risk_state()
+        if not self.trade_id and current_state['locked']:
+            return self.notify('Cannot add trades: '+current_state['reason']+'. Correct account data or contact provider.','error')
+        projected=self._risk_state((values['date'],values['pnl']),exclude_id=self.trade_id)
+        if projected['locked'] and not current_state['locked']:
+            return self.notify('Trade rejected: '+projected['reason']+'. Limits are based on closed P&L.','error')
         keys=COLUMNS
         with connect() as cn:
             if self.trade_id:
-                cn.execute('UPDATE trades SET '+','.join(f'{k}=?' for k in keys)+' WHERE id=?',[values[k] for k in keys]+[self.trade_id])
+                cn.execute('UPDATE trades SET '+','.join(f'{k}=?' for k in keys)+' WHERE id=? AND account_id=?',[values[k] for k in keys]+[self.trade_id,self.account_id])
                 tid=self.trade_id
             else:
-                cur=cn.execute('INSERT INTO trades ('+','.join(keys)+',created_at) VALUES ('+','.join(['?']*(len(keys)+1))+')',[values[k] for k in keys]+[dt.datetime.now().isoformat()])
+                cur=cn.execute('INSERT INTO trades ('+','.join(keys)+',created_at,account_id) VALUES ('+','.join(['?']*(len(keys)+2))+')',[values[k] for k in keys]+[dt.datetime.now().isoformat(),self.account_id])
                 tid=cur.lastrowid
             old={r['slot']:r['path'] for r in cn.execute('SELECT slot,path FROM trade_images WHERE trade_id=?',(tid,))}
             for slot,path in self.pending_images.items():
@@ -1608,7 +1876,7 @@ class App(tk.Tk):
         try:
             with connect() as cn:
                 paths=[r['path'] for r in cn.execute(f'SELECT path FROM trade_images WHERE trade_id IN ({marks})',ids)]
-                cn.execute(f'DELETE FROM trades WHERE id IN ({marks})',ids)
+                cn.execute(f'DELETE FROM trades WHERE id IN ({marks}) AND account_id=?',ids+[self.account_id])
             # Delete files only if no record still references them; backup already holds copies.
             with connect() as cn:
                 remaining={r[0] for r in cn.execute('SELECT path FROM trade_images')}
@@ -1632,7 +1900,7 @@ class App(tk.Tk):
 
     def delete_all_trades(self):
         with connect() as cn:
-            ids=[r[0] for r in cn.execute('SELECT id FROM trades ORDER BY id')]
+            ids=[r[0] for r in cn.execute('SELECT id FROM trades WHERE account_id=? ORDER BY id',(self.account_id,))]
         if not ids:return self.notify('There are no trades to delete.')
         answer=simpledialog.askstring('Delete ALL trades',
             f'This will delete ALL {len(ids)} trades and their screenshots, including rows hidden by search.\n'
