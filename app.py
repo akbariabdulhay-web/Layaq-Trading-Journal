@@ -703,34 +703,55 @@ class App(tk.Tk):
                 (nums['daily_loss_limit'],nums['max_loss_limit'],nums['profit_target'],self.account_id))
         self._render_risk_bars();self.notify('Account risk limits saved.')
 
+    def _toggle_dashboard_risk(self):
+        prefs=get_preferences();prefs['dashboard_risk_visible']=bool(self.dashboard_risk_visible.get());save_preferences(prefs)
+        if self.dashboard_risk_visible.get():
+            self.dashboard_risk_frame.pack(fill='x', padx=10, pady=(0, 9), before=self.period_tabs)
+        else:self.dashboard_risk_frame.pack_forget()
+        self._render_risk_bars()
+
+    def _progress_canvas(self, host, label, amount, limit, is_risk):
+        if limit <= 0:return
+        frac=max(0,min(1,amount/limit))
+        frame=ttk.Frame(host);frame.pack(fill='x',pady=5)
+        ttk.Label(frame,text=f'{label}: ${amount:,.2f} / ${limit:,.2f}  ({100*frac:.1f}%)').pack(anchor='w')
+        canvas=tk.Canvas(frame,height=17,bg=ENTRY,highlightthickness=0)
+        canvas.pack(fill='x')
+        color=(RED if is_risk else GREEN)  # consistent risk-negative and profit-positive encoding
+        def paint(event=None,c=canvas,f=frac,col=color):
+            if not c.winfo_exists():return
+            old=getattr(c,'_anim_after',None)
+            if old:
+                try:c.after_cancel(old)
+                except tk.TclError:pass
+            c.delete('all');bar=c.create_rectangle(0,0,0,17,fill=col,outline='')
+            steps=60
+            def advance(step=0):
+                if not c.winfo_exists():return
+                t=min(1,step/steps);factor=1-(1-t)**3
+                c.coords(bar,0,0,max(0,c.winfo_width())*f*factor,17)
+                if step<steps:c._anim_after=c.after(50,advance,step+1)
+            advance()
+        canvas.bind('<Configure>',paint)
+        canvas.after_idle(paint)
+
     def _render_risk_bars(self):
         if not hasattr(self,'risk_bars'):return
         for c in self.risk_bars.winfo_children():c.destroy()
+        dashboard_target=getattr(self,'dashboard_risk_frame',None)
+        if dashboard_target:
+            for c in dashboard_target.winfo_children():c.destroy()
         state=self._risk_state()
-        for label,amount,limit,is_risk in [('Daily loss used',state['daily'],state['daily_limit'],True),('Total loss used',state['total_loss'],state['max_limit'],True),('Profit target',state['profit'],state['target'],False)]:
-            if limit<=0:continue
-            frac=max(0,min(1,amount/limit))
-            frame=ttk.Frame(self.risk_bars);frame.pack(fill='x',pady=6)
-            ttk.Label(frame,text=f'{label}: ${amount:,.2f} / ${limit:,.2f}  ({100*frac:.1f}%)').pack(anchor='w')
-            canvas=tk.Canvas(frame,height=17,bg=ENTRY,highlightthickness=0)
-            canvas.pack(fill='x')
-            color=(RED if frac>=1 or (is_risk and frac>=.8) else (GREEN if not is_risk else ACCENT))
-            def paint(event,c=canvas,f=frac,col=color):
-                if not c.winfo_exists():return
-                if getattr(c,'_anim_after',None):
-                    try:c.after_cancel(c._anim_after)
-                    except tk.TclError:pass
-                c.delete('all')
-                bar=c.create_rectangle(0,0,0,17,fill=col,outline='')
-                def advance(step=0):
-                    if not c.winfo_exists():return
-                    factor=1-(1-step/13)**3
-                    c.coords(bar,0,0,max(0,c.winfo_width())*f*factor,17)
-                    if step<13:c._anim_after=c.after(22,advance,step+1)
-                advance()
-            canvas.bind('<Configure>',paint)
+        metrics=[('Daily loss used',state['daily'],state['daily_limit'],True),
+                 ('Total loss used',state['total_loss'],state['max_limit'],True),
+                 ('Profit target',state['profit'],state['target'],False)]
+        for label,amount,limit,is_risk in metrics:
+            self._progress_canvas(self.risk_bars,label,amount,limit,is_risk)
+            if dashboard_target and self.dashboard_risk_visible.get():
+                self._progress_canvas(dashboard_target,label,amount,limit,is_risk)
         if state['locked']:
-            ttk.Label(self.risk_bars,text='ACCOUNT LOCKED — '+state['reason']+' (history remains viewable)',foreground=RED).pack(anchor='w')
+            for target in (self.risk_bars, dashboard_target if self.dashboard_risk_visible.get() else None):
+                if target:ttk.Label(target,text='ACCOUNT LOCKED — '+state['reason']+' (history remains viewable)',foreground=RED).pack(anchor='w')
         if hasattr(self,'all_accounts_summary'):
             with connect() as cn:
                 r=cn.execute('SELECT COUNT(*),SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),SUM(pnl) FROM trades WHERE pnl IS NOT NULL').fetchone()
@@ -1102,6 +1123,12 @@ class App(tk.Tk):
             value = tk.Label(box, text='—', font=('Segoe UI Semibold', 16), bg=PANEL, fg=TEXT)
             value.pack(anchor='w', pady=(7, 0))
             self.stats[name] = value
+        self.dashboard_risk_visible = tk.BooleanVar(value=bool(get_preferences().get('dashboard_risk_visible', True)))
+        self.dashboard_risk_toggle = ttk.Checkbutton(self.dashboard, text='Show account risk & profit progress on Dashboard',
+            variable=self.dashboard_risk_visible, command=self._toggle_dashboard_risk)
+        self.dashboard_risk_toggle.pack(anchor='w', padx=12, pady=(0, 4))
+        self.dashboard_risk_frame = ttk.LabelFrame(self.dashboard, text='Active account • Risk & Profit Progress', padding=10)
+        if self.dashboard_risk_visible.get(): self.dashboard_risk_frame.pack(fill='x', padx=10, pady=(0, 9))
         controls = ttk.Frame(self.dashboard)
         controls.pack(fill='x', pady=(0, 8))
         self.period_tabs = ttk.Notebook(self.dashboard)
@@ -1265,7 +1292,6 @@ class App(tk.Tk):
             for i,b in enumerate(buckets):
                 x=xx(i)
                 color = GREEN if b['close'] >= b['open'] else RED
-                c.create_line(x, yy(b['high']), x, yy(b['low']), fill=color, width=5,tags=('plot',))
                 c.create_line(x, yy(b['high']), x, yy(b['low']), fill=color, width=2,tags=('plot',))
                 y0,y1=yy(b['open']),yy(b['close'])
                 c.create_rectangle(x-cw/2,min(y0,y1),x+cw/2,max(y0,y1)+1,fill=color,outline=color,tags=('plot',))
@@ -1281,10 +1307,9 @@ class App(tk.Tk):
             flat=[n for xy in points for n in xy]
             if kind=='Area':
                 base=yy(0) if lo<=0<=hi else yy(lo)
-                c.create_polygon([points[0][0],base]+flat+[points[-1][0],base],fill='#245483',outline='',tags=('plot',))
+                c.create_polygon([points[0][0],base]+flat+[points[-1][0],base],fill=(GREEN if trades[-1]['close']>=trades[0]['open'] else RED),stipple='gray50',outline='',tags=('plot',))
             line_col=GREEN if trades[-1]['close']>=trades[0]['open'] else RED
-            c.create_line(*flat,fill=line_col,width=6,smooth=False,tags=('plot',))
-            c.create_line(*flat,fill=TEXT,width=2,tags=('plot',))
+            c.create_line(*flat,fill=line_col,width=2,smooth=False,tags=('plot',))
             for i,t in enumerate(trades):
                 x,y=xx(i), yy(t['close'])
                 color=GREEN if t['pnl']>=0 else RED
@@ -1300,20 +1325,45 @@ class App(tk.Tk):
                 c.create_text(xx(i),h-46,text=txt,fill=MUTED,font=('Segoe UI',9))
         net=sum(t['pnl'] for t in trades)
         c.create_text(w-right,h-16,anchor='e',text=f'{len(trades)} trades  •  Period P&L: {net:+,.2f}  •  Hover over chart for values',fill=TEXT)
-        # Animate plotted geometry from baseline, without disturbing the axes or labels.
+        # Three-second stroke-reveal: line traces left to right, area fills underneath
+        # the growing line, candle bars appear sequentially.
         c._draw_revision=getattr(c,'_draw_revision',0)+1
         revision=c._draw_revision
-        item_ids=c.find_withtag('plot')
+        item_ids=list(c.find_withtag('plot'))
         if c.winfo_ismapped() and item_ids:
-            baseline=h-75
-            originals={item:c.coords(item) for item in item_ids}
-            def reveal(step=0):
-                if not c.winfo_exists() or c._draw_revision!=revision:return
-                progress=1-(1-min(step,12)/12)**3
-                for item,coords in originals.items():
-                    new=[value if i%2==0 else baseline+(value-baseline)*progress for i,value in enumerate(coords)]
-                    c.coords(item,*new)
-                if step<12:c.after(19,reveal,step+1)
+            originals={item:(c.type(item), c.coords(item)) for item in item_ids}
+            duration_steps=60
+            if kind=='Candlestick':
+                # Each time bucket contains a wick and a body, in creation order.
+                for item in item_ids:c.itemconfigure(item,state='hidden')
+                def reveal(step=0):
+                    if not c.winfo_exists() or c._draw_revision!=revision:return
+                    count=round(len(buckets)*step/duration_steps)
+                    for i,item in enumerate(item_ids):c.itemconfigure(item,state='normal' if i//2<count else 'hidden')
+                    if step<duration_steps:c.after(50,reveal,step+1)
+            else:
+                poly_id=next((item for item in item_ids if originals[item][0]=='polygon'),None)
+                line_id=next((item for item in item_ids if originals[item][0]=='line'),None)
+                point_ids=[item for item in item_ids if originals[item][0]=='oval']
+                for item in point_ids:c.itemconfigure(item,state='hidden')
+                full_points=points[:]
+                def reveal(step=0):
+                    if not c.winfo_exists() or c._draw_revision!=revision:return
+                    fraction=min(1,step/duration_steps)
+                    segment=fraction*(len(full_points)-1)
+                    index=min(len(full_points)-2,int(segment))
+                    local=segment-index
+                    x0,y0=full_points[index];x1,y1=full_points[index+1]
+                    partial=full_points[:index+1]+[(x0+(x1-x0)*local,y0+(y1-y0)*local)]
+                    if line_id is not None:
+                        c.coords(line_id,*[v for point in partial for v in point])
+                    if poly_id is not None:
+                        base=yy(0) if lo<=0<=hi else yy(lo)
+                        polygon=[(partial[0][0],base)]+partial+[(partial[-1][0],base)]
+                        c.coords(poly_id,*[v for point in polygon for v in point])
+                    for i,item in enumerate(point_ids):
+                        c.itemconfigure(item,state='normal' if i+1<=segment+0.00001 else 'hidden')
+                    if step<duration_steps:c.after(50,reveal,step+1)
             reveal()
 
     def chart_unhover(self, period):
@@ -1727,7 +1777,7 @@ class App(tk.Tk):
 
     def _animate_counter(self,label,final,prefix='',suffix=''):
         token=object();label._count_token=token
-        steps=12
+        steps=60
         for step in range(steps+1):
             def tick(i=step):
                 if not label.winfo_exists() or getattr(label,'_count_token',None) is not token:return
@@ -1736,7 +1786,7 @@ class App(tk.Tk):
                 if final != 0:
                     label.config(fg=RED if final<0 else GREEN)
                 if i==steps and final!=0:self._pulse_value_glow(label,final)
-            self.after(step*22,tick)
+            self.after(step*50,tick)
 
     def _pulse_value_glow(self,label,value):
         """Brief restrained colored luminosity pulse on positive/negative metrics."""
