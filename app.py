@@ -27,13 +27,34 @@ DB = BASE / 'journal.sqlite3'
 BACKUPS = BASE / 'backups'
 AUTH = BASE / 'access.json'
 LOGO = BASE / 'custom_logo.png'
+PREFERENCES = BASE / 'preferences.json'
 BASE.mkdir(parents=True, exist_ok=True)
 IMAGES.mkdir(exist_ok=True)
 BACKUPS.mkdir(exist_ok=True)
 
 BG, PANEL, ENTRY, TEXT, MUTED, ACCENT, GREEN, RED = '#0b1220', '#152238', '#1f3048', '#f1f6ff', '#a3b6ca', '#5db9ff', '#45d6ad', '#ff6d82'
+DARK_PALETTE = ('#0b1220', '#152238', '#1f3048', '#f1f6ff', '#a3b6ca', '#5db9ff', '#45d6ad', '#ff6d82')
+LIGHT_PALETTE = ('#f2f6fc', '#ffffff', '#e3ebf7', '#182639', '#52677d', '#1465ba', '#168061', '#c63e54')
+
+def get_preferences():
+    try:
+        data = json.loads(PREFERENCES.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+def save_preferences(data):
+    tmp = PREFERENCES.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    os.replace(tmp, PREFERENCES)
+
+def set_palette(mode):
+    global BG, PANEL, ENTRY, TEXT, MUTED, ACCENT, GREEN, RED
+    BG, PANEL, ENTRY, TEXT, MUTED, ACCENT, GREEN, RED = LIGHT_PALETTE if mode == 'Light' else DARK_PALETTE
+
+set_palette(get_preferences().get('theme', 'Dark'))
 IMAGE_FIELDS = [f'{stage.lower()}_{tf.lower()}' for stage in ('Before', 'After') for tf in ('HTF', 'MTF', 'LTF')]
-COLUMNS = ['date', 'symbol', 'market', 'side', 'session', 'strategy', 'entry', 'exit', 'stop', 'target', 'size', 'risk', 'fees', 'pnl', 'pnl_high', 'pnl_low', 'emotion', 'setup', 'review']
+COLUMNS = ['date', 'symbol', 'market', 'side', 'session', 'strategy', 'entry', 'exit', 'stop', 'target', 'size', 'risk', 'fees', 'pnl', 'pnl_high', 'pnl_low', 'emotion', 'plan_followed', 'setup_grade', 'setup', 'review']
 
 
 @contextmanager
@@ -59,13 +80,15 @@ def setup():
             id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, symbol TEXT NOT NULL,
             market TEXT, side TEXT, session TEXT, strategy TEXT, entry REAL,
             exit REAL, stop REAL, target REAL, size REAL, risk REAL, fees REAL,
-            pnl REAL, pnl_high REAL, pnl_low REAL, emotion TEXT, setup TEXT, review TEXT, created_at TEXT NOT NULL)''')
+            pnl REAL, pnl_high REAL, pnl_low REAL, emotion TEXT, plan_followed TEXT, setup_grade TEXT, setup TEXT, review TEXT, created_at TEXT NOT NULL)''')
         cn.execute('''CREATE TABLE IF NOT EXISTS trade_images (
             trade_id INTEGER NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
             slot TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(trade_id, slot))''')
         existing = {r[1] for r in cn.execute('PRAGMA table_info(trades)')}
-        for name in ('pnl_high', 'pnl_low'):
-            if name not in existing: cn.execute(f'ALTER TABLE trades ADD COLUMN {name} REAL')
+        for name in ('pnl_high', 'pnl_low', 'plan_followed', 'setup_grade'):
+            if name not in existing:
+                typ = 'TEXT' if name in ('plan_followed', 'setup_grade') else 'REAL'
+                cn.execute(f'ALTER TABLE trades ADD COLUMN {name} {typ}')
         cn.execute('CREATE INDEX IF NOT EXISTS ix_trades_date ON trades(date)')
         cn.execute('CREATE INDEX IF NOT EXISTS ix_trades_symbol ON trades(symbol)')
 
@@ -142,6 +165,7 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self._logo_image = None
         self._logo_widgets = []
+        self.theme_mode = tk.StringVar(value=get_preferences().get('theme','Dark'))
         self._style()
         self._chrome()
         self._set_window_icon()
@@ -441,6 +465,12 @@ class App(tk.Tk):
     def _make_settings(self):
         box=tk.Frame(self.settings_tab,bg=PANEL,padx=24,pady=24)
         box.pack(anchor='nw',fill='x',padx=25,pady=25)
+        theme_row = ttk.Frame(box)
+        theme_row.pack(fill='x', pady=(0,16))
+        ttk.Label(theme_row,text='APPEARANCE  /  THEME',font=('Segoe UI Semibold',16)).pack(side='left',padx=(0,18))
+        for mode in ('Dark','Light'):
+            ttk.Radiobutton(theme_row,text=mode,value=mode,variable=self.theme_mode,
+                            command=self._change_theme).pack(side='left',padx=8)
         ttk.Label(box,text='Security settings',font=('Segoe UI Semibold',19)).pack(anchor='w',pady=(0,10))
         self.security_status=tk.StringVar()
         ttk.Label(box,textvariable=self.security_status).pack(anchor='w',pady=8)
@@ -461,6 +491,35 @@ class App(tk.Tk):
         ttk.Button(box,text='Export Windows Icon (.ico)',command=self._export_icon).pack(anchor='w',pady=5)
         ttk.Button(box,text='Restore Default App Logo',command=self._reset_logo).pack(anchor='w',pady=5)
         self._refresh_security_label()
+
+    def _change_theme(self, *args):
+        mode = self.theme_mode.get()
+        previous = (BG, PANEL, ENTRY, TEXT, MUTED, ACCENT, GREEN, RED)
+        set_palette(mode)
+        updated = (BG, PANEL, ENTRY, TEXT, MUTED, ACCENT, GREEN, RED)
+        save_preferences({**get_preferences(), 'theme': mode})
+        replacements = dict(zip(previous, updated))
+        self._style()
+        def recolor(widget):
+            if not isinstance(widget, ttk.Widget):
+                try:
+                    opts = widget.configure()
+                    for name in ('bg', 'background', 'fg', 'foreground', 'insertbackground', 'selectbackground', 'highlightbackground'):
+                        if name in opts:
+                            val = widget.cget(name)
+                            if isinstance(val, str) and val.lower() in replacements:
+                                widget.configure(**{name: replacements[val.lower()]})
+                except (tk.TclError, KeyError):
+                    pass
+            for child in widget.winfo_children():
+                recolor(child)
+        recolor(self)
+        # Refresh graph frames and analytics whenever the dashboard is available.
+        try:
+            self.refresh()
+        except (AttributeError, tk.TclError):
+            pass
+        self.notify(f'{mode} theme enabled. Preference saved.')
 
     def _logo_source(self):
         if LOGO.is_file():
@@ -1044,6 +1103,44 @@ class App(tk.Tk):
             value.pack(anchor='w', pady=5)
             self.analytics_labels[n] = value
         for col in range(6): self.analytics_numbers.grid_columnconfigure(col, weight=1)
+        # Discipline summary follows the same period filter as all other analytics.
+        discipline = tk.Frame(outer, bg=PANEL, padx=16, pady=12)
+        discipline.pack(fill='x', pady=(0, 14))
+        tk.Label(discipline, text='TRADING PLAN DISCIPLINE', bg=PANEL, fg=TEXT,
+                 font=('Segoe UI Semibold', 13)).pack(anchor='w')
+        tk.Label(discipline, text='Based on all saved trades in this period. Unanswered trades are counted separately.',
+                 bg=PANEL, fg=MUTED).pack(anchor='w', pady=(2, 8))
+        self.discipline_labels = {}
+        cards = tk.Frame(discipline, bg=PANEL)
+        cards.pack(fill='x')
+        for index, label in enumerate(('Followed Plan', 'Did Not Follow Plan', 'Not Marked', 'Plan Compliance Rate')):
+            col = tk.Frame(cards, bg=ENTRY, padx=12, pady=8)
+            col.grid(row=0, column=index, sticky='nsew', padx=5)
+            tk.Label(col, text=label, bg=ENTRY, fg=MUTED).pack(anchor='w')
+            value = tk.Label(col, text='—', bg=ENTRY, fg=TEXT, font=('Segoe UI Semibold', 16))
+            value.pack(anchor='w', pady=(4, 0))
+            self.discipline_labels[label] = value
+            cards.grid_columnconfigure(index, weight=1)
+        grades = tk.Frame(outer, bg=PANEL, padx=16, pady=12)
+        grades.pack(fill='x', pady=(0,14))
+        tk.Label(grades, text='SETUP QUALITY  /  GRADE DISTRIBUTION', bg=PANEL, fg=TEXT,
+                 font=('Segoe UI Semibold',13)).pack(anchor='w')
+        tk.Label(grades,text='Percentages are calculated from graded trades only. Unrated trades are shown separately.',
+                 bg=PANEL,fg=MUTED).pack(anchor='w',pady=(2,8))
+        grade_cards=tk.Frame(grades,bg=PANEL)
+        grade_cards.pack(fill='x')
+        self.grade_labels={}
+        for idx,label in enumerate(('A+','A','B','C','Not Graded')):
+            card=tk.Frame(grade_cards,bg=ENTRY,padx=11,pady=7)
+            card.grid(row=0,column=idx,sticky='nsew',padx=4)
+            tk.Label(card,text=label,bg=ENTRY,fg=MUTED).pack(anchor='w')
+            value=tk.Label(card,text='—',bg=ENTRY,fg=TEXT,font=('Segoe UI Semibold',16))
+            value.pack(anchor='w',pady=(4,0))
+            self.grade_labels[label]=value
+            grade_cards.grid_columnconfigure(idx,weight=1)
+        self.grade_chart = ttk.Progressbar(grades, orient='horizontal', mode='determinate', maximum=100)
+        self.grade_chart.pack(fill='x',pady=(9,0))
+        tk.Label(grades,text='A+ share of graded trades',bg=PANEL,fg=MUTED).pack(anchor='w')
         tables = ttk.Frame(outer)
         tables.pack(fill='both', expand=True)
         self.analytics_tables = {}
@@ -1105,6 +1202,34 @@ class App(tk.Tk):
             'Payoff Ratio':f'{avgwin/avgloss:.2f}' if avgloss and wins else '—'
         }
         for key, label in self.analytics_labels.items(): label.config(text=report[key])
+        # Include open trades in plan discipline, since compliance is a decision
+        # about the entry, not a result of profit or loss.
+        all_period_trades = []
+        for row in self._all_trades():
+            try:
+                d = dt.datetime.strptime(str(row['date'])[:16], '%Y-%m-%d %H:%M').date()
+            except (ValueError, TypeError):
+                continue
+            if period == 'This Year' and d.year != today.year: continue
+            if period == 'This Month' and (d.year, d.month) != (today.year, today.month): continue
+            if period == 'This Week' and d.isocalendar()[:2] != today.isocalendar()[:2]: continue
+            all_period_trades.append(row)
+        yes = sum(r['plan_followed'] == 'Yes' for r in all_period_trades)
+        no = sum(r['plan_followed'] == 'No' for r in all_period_trades)
+        unknown = len(all_period_trades) - yes - no
+        rated = yes + no
+        for key, val in {'Followed Plan': str(yes), 'Did Not Follow Plan': str(no),
+                         'Not Marked': str(unknown),
+                         'Plan Compliance Rate': f'{yes / rated * 100:.1f}%' if rated else '—'}.items():
+            self.discipline_labels[key].config(text=val)
+        counts={grade:sum(row['setup_grade']==grade for row in all_period_trades)
+                for grade in ('A+','A','B','C')}
+        rated_count=sum(counts.values())
+        for grade, count in counts.items():
+            percentage=(100*count/rated_count) if rated_count else 0
+            self.grade_labels[grade].config(text=f'{count}  /  {percentage:.1f}%')
+        self.grade_labels['Not Graded'].config(text=str(len(all_period_trades)-rated_count))
+        self.grade_chart['value']=(100*counts['A+']/rated_count) if rated_count else 0
         for name, field in (('Strategy Performance','strategy'),('Session Performance','session'),('Symbol Performance','symbol')):
             grouped = defaultdict(list)
             for _, row, pnl in records:
@@ -1123,15 +1248,25 @@ class App(tk.Tk):
         ent = ttk.Entry(bar, textvariable=self.search_var, width=30)
         ent.pack(side='left', padx=5)
         ent.bind('<KeyRelease>', lambda e: self.load_history())
+        ttk.Label(bar, text='Plan:').pack(side='left', padx=(12, 3))
+        self.history_plan_filter = tk.StringVar(value='All')
+        ttk.Combobox(bar, textvariable=self.history_plan_filter, state='readonly', width=13,
+                     values=['All', 'Yes', 'No', 'Not Marked']).pack(side='left', padx=3)
+        self.history_plan_filter.trace_add('write', lambda *_: self.load_history())
+        ttk.Label(bar, text='Grade:').pack(side='left', padx=(10, 3))
+        self.history_grade_filter = tk.StringVar(value='All')
+        ttk.Combobox(bar, textvariable=self.history_grade_filter, state='readonly', width=11,
+                     values=['All','A+','A','B','C','Not Graded']).pack(side='left', padx=3)
+        self.history_grade_filter.trace_add('write', lambda *_: self.load_history())
         ttk.Button(bar, text='+ New Trade', style='Accent.TButton', command=self.new_trade).pack(side='right', padx=5)
         ttk.Button(bar, text='Delete All Trades', command=self.delete_all_trades).pack(side='right', padx=5)
         ttk.Button(bar, text='Delete Selected', command=self.delete_selected).pack(side='right', padx=5)
         ttk.Button(bar, text='Select All', command=self.select_all_trades).pack(side='right', padx=5)
         ttk.Button(bar, text='Clear Selection', command=self.clear_trade_selection).pack(side='right', padx=5)
         ttk.Button(bar, text='Edit Selected', command=self.edit_selected).pack(side='right', padx=5)
-        cols = ('id','date','symbol','market','side','session','strategy','entry','exit','pnl','emotion')
+        cols = ('id','date','symbol','market','side','session','strategy','entry','exit','pnl','emotion','plan_followed','setup_grade')
         self.tree = ttk.Treeview(self.history, columns=cols, show='headings', selectmode='extended')
-        sizes = dict(id=55, date=145, symbol=105, market=90, side=70, session=110, strategy=155, entry=95, exit=95, pnl=105, emotion=115)
+        sizes = dict(id=55, date=145, symbol=105, market=90, side=70, session=110, strategy=155, entry=95, exit=95, pnl=105, emotion=115, plan_followed=115, setup_grade=105)
         for col in cols:
             self.tree.heading(col, text=col.upper(), command=lambda c=col: self.sort_history(c))
             self.tree.column(col, width=sizes[col], minwidth=50)
@@ -1208,10 +1343,14 @@ class App(tk.Tk):
             ('target','Take profit','entry'), ('size','Position size / lots','entry'),
             ('risk','Risk amount','entry'), ('fees','Fees / commission','entry'),
             ('pnl','Realized net P&L','entry'),
-            ('pnl_high','Trade peak P&L (optional)','entry'), ('pnl_low','Trade trough P&L (optional)','entry'), ('emotion','Emotion','combo')]
+            ('pnl_high','Trade peak P&L (optional)','entry'), ('pnl_low','Trade trough P&L (optional)','entry'), ('emotion','Emotion','combo'),
+            ('plan_followed','Did I Follow My Trading Plan?','combo'),
+            ('setup_grade','Setup Quality / Grade','combo')]
         choices = {'market':['Forex','Gold','Crypto','Stocks','Indices','Other'],
                    'side':['Buy','Sell'], 'session':['Asia','London','New York','Overlap','Other'],
-                   'emotion':['Calm','Confident','Fear','Greed','FOMO','Revenge','Impatient','Other']}
+                   'emotion':['Calm','Confident','Fear','Greed','FOMO','Revenge','Impatient','Other'],
+                   'plan_followed':['Not Marked','Yes','No'],
+                   'setup_grade':['Not Graded','A+','A','B','C']}
         for i,(key,label,kind) in enumerate(config):
             ttk.Label(form, text=label).grid(row=i, column=0, sticky='w', pady=4)
             v = tk.StringVar()
@@ -1291,12 +1430,18 @@ class App(tk.Tk):
         q=self.search_var.get().lower().strip()
         with connect() as cn:
             rows=cn.execute('SELECT * FROM trades ORDER BY id DESC').fetchall()
-        rows=[r for r in rows if q in ' '.join(str(r[k] or '') for k in ('id','date','symbol','market','side','session','strategy','emotion')).lower()]
+        rows=[r for r in rows if q in ' '.join(str(r[k] or '') for k in ('id','date','symbol','market','side','session','strategy','emotion','plan_followed')).lower()]
+        plan_filter = self.history_plan_filter.get()
+        if plan_filter != 'All':
+            rows = [r for r in rows if (r['plan_followed'] or 'Not Marked') == plan_filter]
+        grade_filter = self.history_grade_filter.get()
+        if grade_filter != 'All':
+            rows = [r for r in rows if (r['setup_grade'] or 'Not Graded') == grade_filter]
         rows=sorted(rows,key=lambda r: (r[self.sort_col] is not None, r[self.sort_col] if r[self.sort_col] is not None else ''),reverse=self.sort_reverse)
         self.tree.delete(*self.tree.get_children())
         for r in rows:
             p=r['pnl']
-            self.tree.insert('', 'end', iid=str(r['id']), values=[f'{r[k]:,.2f}' if k in ('entry','exit','pnl') and r[k] is not None else (r[k] if r[k] is not None else '') for k in self.tree['columns']], tags=('win',) if p is not None and p>0 else ('loss',) if p is not None and p<0 else ())
+            self.tree.insert('', 'end', iid=str(r['id']), values=[f'{r[k]:,.2f}' if k in ('entry','exit','pnl') and r[k] is not None else (r[k] if r[k] is not None else ('Not Marked' if k == 'plan_followed' else 'Not Graded' if k == 'setup_grade' else '')) for k in self.tree['columns']], tags=('win',) if p is not None and p>0 else ('loss',) if p is not None and p<0 else ())
 
     def sort_history(self, col):
         if self.sort_col==col:self.sort_reverse=not self.sort_reverse
@@ -1311,6 +1456,8 @@ class App(tk.Tk):
         self.fields['market'].set('Forex')
         self.fields['side'].set('Buy')
         self.fields['emotion'].set('Calm')
+        self.fields['plan_followed'].set('Not Marked')
+        self.fields['setup_grade'].set('Not Graded')
         self.setup_note.delete('1.0','end')
         self.review_note.delete('1.0','end')
         self.editor_title.config(text='New Trade')
@@ -1329,7 +1476,7 @@ class App(tk.Tk):
             images=cn.execute('SELECT slot,path FROM trade_images WHERE trade_id=?',(trade_id,)).fetchall()
         if not row:return
         self.trade_id=trade_id
-        for k,v in self.fields.items():v.set('' if row[k] is None else str(row[k]))
+        for k,v in self.fields.items():v.set(('Not Marked' if k == 'plan_followed' else 'Not Graded' if k == 'setup_grade' else '') if row[k] is None else str(row[k]))
         self.setup_note.delete('1.0','end');self.setup_note.insert('1.0',row['setup'] or '')
         self.review_note.delete('1.0','end');self.review_note.insert('1.0',row['review'] or '')
         self.pending_images={r['slot']:r['path'] for r in images}
@@ -1339,12 +1486,20 @@ class App(tk.Tk):
 
     def save_trade(self):
         values={k:v.get().strip() for k,v in self.fields.items()}
+        if values['setup_grade'] not in ('A+','A','B','C','Not Graded'):
+            values['setup_grade'] = 'Not Graded'
+        if values['plan_followed'] not in ('Yes','No','Not Marked'):
+            values['plan_followed'] = 'Not Marked'
         if not values['symbol']:return self.notify('Enter a symbol before saving.', 'error')
         try:dt.datetime.strptime(values['date'],'%Y-%m-%d %H:%M')
         except ValueError:return self.notify('Date must use YYYY-MM-DD HH:MM.', 'error')
         for k in ('entry','exit','stop','target','size','risk','fees','pnl','pnl_high','pnl_low'):
             try:values[k]=float(values[k]) if values[k] else None
             except ValueError:return self.notify(f'{k} must be a number.', 'error')
+        if values['plan_followed'] == 'Not Marked':
+            values['plan_followed'] = None
+        if values['setup_grade'] == 'Not Graded':
+            values['setup_grade'] = None
         values['setup']=self.setup_note.get('1.0','end').strip()
         values['review']=self.review_note.get('1.0','end').strip()
         keys=COLUMNS
