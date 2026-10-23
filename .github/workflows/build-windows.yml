@@ -21,7 +21,7 @@ jobs:
           python -m PyInstaller --noconfirm --clean --onefile --windowed --name LayaqTradingJournal --icon icon.ico --add-data "icon.png;." --add-data "sidebar_art.png;." --add-data "dashboard_art.png;." app.py
       - uses: actions/upload-artifact@v4
         with:
-          name: LayaqTradingJournal-V27-Windows
+          name: LayaqTradingJournal-V30-Windows
           path: dist/LayaqTradingJournal.exe
           if-no-files-found: error
           retention-days: 7
