@@ -151,12 +151,16 @@ class _EmbeddedInput:
         return _ACTIVE_APP._overlay_prompt(title, prompt, mode='entry', secret=kw.get('show')=='*')
 
 class _EmbeddedFiles:
+    """Use the Windows native file chooser for images, backups and restores."""
     @staticmethod
     def askopenfilename(**kw):
-        return _ACTIVE_APP._file_overlay(kw, save=False)
+        kw.setdefault('parent', _ACTIVE_APP)
+        return _native_filedialog.askopenfilename(**kw)
+
     @staticmethod
     def asksaveasfilename(**kw):
-        return _ACTIVE_APP._file_overlay(kw, save=True)
+        kw.setdefault('parent', _ACTIVE_APP)
+        return _native_filedialog.asksaveasfilename(**kw)
 
 messagebox = _EmbeddedMessages()
 simpledialog = _EmbeddedInput()
@@ -357,6 +361,7 @@ class App(tk.Tk):
         self.login_password = tk.StringVar()
         self.login_confirm = tk.StringVar()
         self.login_master = tk.StringVar()
+        self.login_entry = None
         try:
             record = auth_record()
         except (OSError, ValueError) as exc:
@@ -365,8 +370,10 @@ class App(tk.Tk):
         if record is None:
             tk.Label(pane,text='FIRST-TIME SECURITY SETUP',fg=ACCENT,bg=PANEL).pack(pady=6)
             tk.Label(pane,text='Choose your login password (at least 8 characters).',fg=TEXT,bg=PANEL).pack()
-            self._secret_entry(pane, 'Password', self.login_password)
+            password_entry = self._secret_entry(pane, 'Password', self.login_password)
+            self.login_entry = password_entry
             self._secret_entry(pane, 'Confirm password', self.login_confirm)
+            self.after(150, lambda e=password_entry: e.focus_set() if e.winfo_exists() else None)
             ttk.Button(pane,text='Create security keys',style='Accent.TButton',command=self._create_credentials).pack(fill='x',pady=(12,4))
         elif not record.get('enabled',True):
             self.auth_frame.destroy()
@@ -374,7 +381,9 @@ class App(tk.Tk):
             return
         else:
             tk.Label(pane,text='Unlock using your password or master key',fg=MUTED,bg=PANEL).pack(pady=6)
-            self._secret_entry(pane, 'Password / Master key', self.login_password)
+            password_entry = self._secret_entry(pane, 'Password / Master key', self.login_password)
+            self.login_entry = password_entry
+            self.after(150, lambda e=password_entry: e.focus_set() if e.winfo_exists() else None)
             ttk.Button(pane,text='Unlock',style='Accent.TButton',command=self._unlock).pack(fill='x',pady=9)
             self.bind('<Return>',lambda _e:self._unlock())
         tk.Label(pane,textvariable=self.login_feedback,fg=RED,bg=PANEL,wraplength=390).pack(pady=6)
@@ -432,6 +441,8 @@ class App(tk.Tk):
         else:
             self.login_feedback.set('Incorrect password or recovery key.')
             self.login_password.set('')
+            if self.login_entry and self.login_entry.winfo_exists():
+                self.login_entry.focus_set()
 
     def _open_main(self):
         setup()
