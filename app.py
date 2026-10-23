@@ -53,6 +53,17 @@ def set_palette(mode):
     BG, PANEL, ENTRY, TEXT, MUTED, ACCENT, GREEN, RED = LIGHT_PALETTE if mode == 'Light' else DARK_PALETTE
 
 set_palette(get_preferences().get('theme', 'Dark'))
+# Emoji-enhanced emotion selection; stored values stay backward-compatible.
+EMOTION_EMOJI = {
+    'Calm': '😌', 'Confident': '😎', 'Fear': '😨', 'Greed': '🤑',
+    'FOMO': '😬', 'Revenge': '😠', 'Impatient': '😤', 'Other': '🤔',
+}
+def emotion_label(value):
+    return f'{EMOTION_EMOJI[value]} {value}' if value in EMOTION_EMOJI else value
+
+def plain_emotion(value):
+    return next((name for name in EMOTION_EMOJI if value == emotion_label(name)), value)
+
 IMAGE_FIELDS = [f'{stage.lower()}_{tf.lower()}' for stage in ('Before', 'After') for tf in ('HTF', 'MTF', 'LTF')]
 COLUMNS = ['date', 'symbol', 'market', 'side', 'session', 'strategy', 'entry', 'exit', 'stop', 'target', 'size', 'risk', 'fees', 'pnl', 'pnl_high', 'pnl_low', 'emotion', 'plan_followed', 'setup_grade', 'setup', 'review']
 
@@ -1348,7 +1359,7 @@ class App(tk.Tk):
             ('setup_grade','Setup Quality / Grade','combo')]
         choices = {'market':['Forex','Gold','Crypto','Stocks','Indices','Other'],
                    'side':['Buy','Sell'], 'session':['Asia','London','New York','Overlap','Other'],
-                   'emotion':['Calm','Confident','Fear','Greed','FOMO','Revenge','Impatient','Other'],
+                   'emotion':[emotion_label(name) for name in EMOTION_EMOJI],
                    'plan_followed':['Not Marked','Yes','No'],
                    'setup_grade':['Not Graded','A+','A','B','C']}
         for i,(key,label,kind) in enumerate(config):
@@ -1455,7 +1466,7 @@ class App(tk.Tk):
         self.fields['date'].set(dt.datetime.now().strftime('%Y-%m-%d %H:%M'))
         self.fields['market'].set('Forex')
         self.fields['side'].set('Buy')
-        self.fields['emotion'].set('Calm')
+        self.fields['emotion'].set(emotion_label('Calm'))
         self.fields['plan_followed'].set('Not Marked')
         self.fields['setup_grade'].set('Not Graded')
         self.setup_note.delete('1.0','end')
@@ -1476,7 +1487,9 @@ class App(tk.Tk):
             images=cn.execute('SELECT slot,path FROM trade_images WHERE trade_id=?',(trade_id,)).fetchall()
         if not row:return
         self.trade_id=trade_id
-        for k,v in self.fields.items():v.set(('Not Marked' if k == 'plan_followed' else 'Not Graded' if k == 'setup_grade' else '') if row[k] is None else str(row[k]))
+        for k,v in self.fields.items():
+            raw = ('Not Marked' if k == 'plan_followed' else 'Not Graded' if k == 'setup_grade' else '') if row[k] is None else str(row[k])
+            v.set(emotion_label(plain_emotion(raw)) if k == 'emotion' else raw)
         self.setup_note.delete('1.0','end');self.setup_note.insert('1.0',row['setup'] or '')
         self.review_note.delete('1.0','end');self.review_note.insert('1.0',row['review'] or '')
         self.pending_images={r['slot']:r['path'] for r in images}
@@ -1486,6 +1499,7 @@ class App(tk.Tk):
 
     def save_trade(self):
         values={k:v.get().strip() for k,v in self.fields.items()}
+        values['emotion'] = plain_emotion(values['emotion'])
         if values['setup_grade'] not in ('A+','A','B','C','Not Graded'):
             values['setup_grade'] = 'Not Graded'
         if values['plan_followed'] not in ('Yes','No','Not Marked'):
