@@ -6,6 +6,8 @@ import json
 import secrets
 import datetime as dt
 import calendar
+import math
+import random
 from collections import defaultdict
 import os
 import shutil
@@ -202,15 +204,58 @@ class App(tk.Tk):
         self._style()
         self._chrome()
         self._set_window_icon()
+        self._flame_particles = []
+        self._flame_job = None
+        self._flame_rng = random.Random(1204)
+        self._flame_phase = 0
+        self._init_ambient_flames()
         self._toast_job = None
         self._toast_frame = None
         self._pulse_job = None
         self._show_access_screen()
 
+    def _init_ambient_flames(self):
+        """Subtle perpetual warm flames in a header backdrop; never covers controls."""
+        self.ambient = tk.Canvas(self, height=52, bg=BG, highlightthickness=0,
+                                 bd=0, takefocus=0)
+        # Place directly below custom chrome; the rest of the UI remains fully usable.
+        self.ambient.pack(fill='x', side='top')
+        for i in range(30):
+            self._flame_particles.append({
+                'x': self._flame_rng.random(), 'phase':self._flame_rng.random(),
+                'rate':.012+self._flame_rng.random()*.023,
+                'size':2+self._flame_rng.random()*4,
+                'lean':self._flame_rng.uniform(-.028,.028)})
+        self._run_ambient_flames()
+
+    def _run_ambient_flames(self):
+        if not self.winfo_exists() or not hasattr(self,'ambient') or not self.ambient.winfo_exists():return
+        c=self.ambient
+        w=max(1,c.winfo_width());h=max(1,c.winfo_height())
+        c.delete('flame')
+        for flame in self._flame_particles:
+            flame['phase']=(flame['phase']+flame['rate'])%1.0
+            p=flame['phase']; x=flame['x']*w + math.sin(p*5)*11 + flame['lean']*p*w
+            y=h+6-p*(h+12)
+            radius=flame['size']*(.8+.4*math.sin(p*math.pi))*(1-p*.5)
+            # small pale flame kernels, deliberately restrained for readability
+            col=('#aa6332' if p<.25 else '#e79a43' if p<.65 else '#dfc38a') if self.theme_mode.get()=='Dark' else ('#e5b77c' if p<.5 else '#c89153')
+            c.create_oval(x-radius/2,y-radius*2,x+radius/2,y+radius,
+                          fill=col,outline='',tags='flame')
+        self._flame_job=self.after(48,self._run_ambient_flames)
+
     def _maximize_custom(self):
         try:
             sw,sh=self.winfo_screenwidth(),self.winfo_screenheight()
-            self.geometry(f'{sw}x{sh}+0+0')
+            # Respect the Windows taskbar's actual work area, including side-mounted bars.
+            try:
+                import ctypes
+                from ctypes import wintypes
+                rect=wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(48,0,ctypes.byref(rect),0):
+                    self.geometry(f'{rect.right-rect.left}x{rect.bottom-rect.top}+{rect.left}+{rect.top}')
+                else:self.geometry(f'{sw}x{sh}+0+0')
+            except Exception:self.geometry(f'{sw}x{sh}+0+0')
             self._maximized=True
         except tk.TclError: pass
 
@@ -262,6 +307,7 @@ class App(tk.Tk):
         if not hasattr(self,'tabs'):return
         # Gentle in-page highlight, without blocking navigation or changing saved values.
         self._animate_activity(ACCENT)
+        self._animate_visible_numbers()
         current=self.tabs.select()
         try:
             tab=self.nametowidget(current)
@@ -526,11 +572,12 @@ class App(tk.Tk):
         if selected is None or selected==self.account_id: return
         self.account_id=selected
         # An unsaved editor is cleared, never silently reassigned to another account.
-        self.new_trade()
+        if not self._editing_locked():self.new_trade()
         if hasattr(self,'start_balance_var'):
             self.start_balance_var.set(f'{self._starting_balance():.2f}')
         self._load_account_editor()
         self.refresh()
+        self._update_edit_access()
         self.notify('Active account: '+self.account_name_var.get())
 
     def _account_row(self):
@@ -538,8 +585,8 @@ class App(tk.Tk):
             return cn.execute('SELECT * FROM accounts WHERE id=?',(self.account_id,)).fetchone()
 
     def _make_accounts(self):
-        outer=ttk.Frame(self.accounts_tab)
-        outer.pack(fill='both', expand=True, padx=30, pady=20)
+        outer=self._scroll_page(self.accounts_tab)
+        outer.configure(padding=(26,16))
         ttk.Label(outer,text='MULTI-ACCOUNT WORKSPACE',font=('Segoe UI Semibold',22)).pack(anchor='w',pady=(0,8))
         ttk.Label(outer,text='Independent portfolios • numeric funded risk limits • per-account performance').pack(anchor='w',pady=(0,12))
         self.all_accounts_summary=ttk.Label(outer,text='',font=('Segoe UI Semibold',13))
@@ -559,6 +606,7 @@ class App(tk.Tk):
         for opt in ('Demo','Personal Live','Funded Evaluation','Funded Live'):
             ttk.Radiobutton(add,text=opt,value=opt,variable=self.new_acct_kind).pack(side='left',padx=5)
         ttk.Button(add,text='+ Create Account',command=self._add_account).pack(side='right')
+        ttk.Button(add,text='Delete Active Account',command=self._delete_account).pack(side='right',padx=8)
         box=ttk.LabelFrame(outer,text='Selected Account • Funded Rules',padding=16)
         box.pack(fill='both',expand=True,pady=12)
         self.current_acct_title=ttk.Label(box,text='',font=('Segoe UI Semibold',16))
@@ -668,10 +716,21 @@ class App(tk.Tk):
             canvas.pack(fill='x')
             color=(RED if frac>=1 or (is_risk and frac>=.8) else (GREEN if not is_risk else ACCENT))
             def paint(event,c=canvas,f=frac,col=color):
-                c.delete('all');c.create_rectangle(0,0,event.width*f,17,fill=col,outline='')
+                if not c.winfo_exists():return
+                if getattr(c,'_anim_after',None):
+                    try:c.after_cancel(c._anim_after)
+                    except tk.TclError:pass
+                c.delete('all')
+                bar=c.create_rectangle(0,0,0,17,fill=col,outline='')
+                def advance(step=0):
+                    if not c.winfo_exists():return
+                    factor=1-(1-step/13)**3
+                    c.coords(bar,0,0,max(0,c.winfo_width())*f*factor,17)
+                    if step<13:c._anim_after=c.after(22,advance,step+1)
+                advance()
             canvas.bind('<Configure>',paint)
         if state['locked']:
-            ttk.Label(self.risk_bars,text='ACCOUNT LOCKED — '+state['reason'],foreground=RED).pack(anchor='w')
+            ttk.Label(self.risk_bars,text='ACCOUNT LOCKED — '+state['reason']+' (history remains viewable)',foreground=RED).pack(anchor='w')
         if hasattr(self,'all_accounts_summary'):
             with connect() as cn:
                 r=cn.execute('SELECT COUNT(*),SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),SUM(pnl) FROM trades WHERE pnl IS NOT NULL').fetchone()
@@ -913,18 +972,18 @@ class App(tk.Tk):
         s.configure('TLabel', background=BG, foreground=TEXT)
         s.configure('Muted.TLabel', background=BG, foreground=MUTED)
         s.configure('TButton', background=ENTRY, foreground=TEXT, padding=(10, 7), borderwidth=0)
-        s.map('TButton', background=[('active', '#415b7a'), ('pressed','#27405f')], foreground=[('disabled','#73859b')])
+        s.map('TButton', background=[('active', ACCENT), ('pressed',ACCENT)], foreground=[('disabled',MUTED),('active',BG)])
         s.configure('Accent.TButton', background=ACCENT, foreground='#071426', padding=(14,9))
-        s.map('Accent.TButton',background=[('active','#72b8ff'),('pressed','#3289d9')])
+        s.map('Accent.TButton',background=[('active',ENTRY),('pressed',ENTRY)],foreground=[('active',TEXT)])
         s.configure('TEntry', fieldbackground=ENTRY, foreground=TEXT, insertcolor=TEXT, padding=6)
         s.configure('TCombobox', fieldbackground=ENTRY, background=ENTRY, foreground=TEXT, padding=5)
         s.map('TCombobox', fieldbackground=[('readonly', ENTRY)], foreground=[('readonly', TEXT)])
         s.configure('Treeview', background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=30, borderwidth=0)
-        s.map('Treeview', background=[('selected', '#245483')], foreground=[('selected', 'white')])
+        s.map('Treeview', background=[('selected', ACCENT)], foreground=[('selected', BG)])
         s.configure('Treeview.Heading', background=ENTRY, foreground=TEXT, padding=8)
         s.configure('TNotebook', background=BG, borderwidth=0)
         s.configure('TNotebook.Tab', padding=(16, 9), background=ENTRY, foreground=TEXT)
-        s.map('TNotebook.Tab', background=[('selected', PANEL),('active','#30405a')], foreground=[('selected','#8bd2ff'),('active','#f9fbff')])
+        s.map('TNotebook.Tab', background=[('selected', PANEL),('active',ENTRY)], foreground=[('selected',ACCENT),('active',TEXT)])
 
     def _layout(self):
         header = tk.Frame(self, bg=BG)
@@ -938,8 +997,10 @@ class App(tk.Tk):
         self.account_picker.bind('<<ComboboxSelected>>', self._switch_account)
         self._update_account_picker()
         ttk.Button(header, text='+ Add Account', command=lambda: self.tabs.select(self.accounts_tab)).pack(side='left', padx=5)
-        ttk.Button(header, text='Save Trade' , style='Accent.TButton', command=self.save_trade).pack(side='right', padx=4)
-        ttk.Button(header, text='+ New Trade', style='Accent.TButton', command=self.new_trade).pack(side='right', padx=4)
+        self.header_save = ttk.Button(header, text='Save Trade', style='Accent.TButton', command=self.save_trade)
+        self.header_save.pack(side='right', padx=4)
+        self.header_new = ttk.Button(header, text='+ New Trade', style='Accent.TButton', command=self.new_trade)
+        self.header_new.pack(side='right', padx=4)
         ttk.Button(header, text='Backup', command=self.backup).pack(side='right', padx=4)
         ttk.Button(header, text='Restore', command=self.restore).pack(side='right', padx=4)
         ttk.Button(header, text='Export CSV', command=self.export_csv).pack(side='right', padx=4)
@@ -955,7 +1016,9 @@ class App(tk.Tk):
         self.analytics_tab = ttk.Frame(self.tabs)
         self.tabs.add(self.dashboard, text='Dashboard')
         self.tabs.add(self.history, text='Trade History')
-        self.tabs.add(self.editor, text='Trade Editor & Charts')
+        self.tabs.add(self.editor, text='Add / Edit Trade')
+        self.detail_tab = ttk.Frame(self.tabs)
+        self.tabs.add(self.detail_tab, text='Trade Details')
         self.tabs.add(self.calendar_tab, text='Trading Calendar')
         self.tabs.add(self.analytics_tab, text='Advanced Analytics')
         self.accounts_tab = ttk.Frame(self.tabs)
@@ -964,11 +1027,13 @@ class App(tk.Tk):
         self._make_dashboard()
         self._make_history()
         self._make_editor()
+        self._make_trade_details()
         self._make_settings()
         self._make_accounts()
         self._make_calendar()
         self._make_analytics()
         self.tabs.bind('<<NotebookTabChanged>>', self._on_tab_change)
+        self._update_edit_access()
 
     def notify(self, message, kind='success', duration=3400):
         """Non-modal notification inside the application; never opens a second window."""
@@ -1200,9 +1265,10 @@ class App(tk.Tk):
             for i,b in enumerate(buckets):
                 x=xx(i)
                 color = GREEN if b['close'] >= b['open'] else RED
-                c.create_line(x, yy(b['high']), x, yy(b['low']), fill=color, width=2)
+                c.create_line(x, yy(b['high']), x, yy(b['low']), fill=color, width=5,tags=('plot',))
+                c.create_line(x, yy(b['high']), x, yy(b['low']), fill=color, width=2,tags=('plot',))
                 y0,y1=yy(b['open']),yy(b['close'])
-                c.create_rectangle(x-cw/2,min(y0,y1),x+cw/2,max(y0,y1)+1,fill=color,outline=color)
+                c.create_rectangle(x-cw/2,min(y0,y1),x+cw/2,max(y0,y1)+1,fill=color,outline=color,tags=('plot',))
                 label=b['time'].strftime('%Y-%m-%d %H:%M')
                 hover=(f'{label}  |  {b["count"]} trades\n'
                        f'Open: {b["open"]:+,.2f}     High: {b["high"]:+,.2f}\n'
@@ -1215,12 +1281,14 @@ class App(tk.Tk):
             flat=[n for xy in points for n in xy]
             if kind=='Area':
                 base=yy(0) if lo<=0<=hi else yy(lo)
-                c.create_polygon([points[0][0],base]+flat+[points[-1][0],base],fill='#245483',outline='')
-            c.create_line(*flat, fill=GREEN if trades[-1]['close']>=trades[0]['open'] else RED, width=2)
+                c.create_polygon([points[0][0],base]+flat+[points[-1][0],base],fill='#245483',outline='',tags=('plot',))
+            line_col=GREEN if trades[-1]['close']>=trades[0]['open'] else RED
+            c.create_line(*flat,fill=line_col,width=6,smooth=False,tags=('plot',))
+            c.create_line(*flat,fill=TEXT,width=2,tags=('plot',))
             for i,t in enumerate(trades):
                 x,y=xx(i), yy(t['close'])
                 color=GREEN if t['pnl']>=0 else RED
-                c.create_oval(x-3,y-3,x+3,y+3,fill=color,outline='')
+                c.create_oval(x-3,y-3,x+3,y+3,fill=color,outline='',tags=('plot',))
                 hover=(f'Trade #{t["id"]}  |  {t["date"].strftime("%Y-%m-%d %H:%M")}\n'
                        f'{t["symbol"]}  |  Trade P&L: {t["pnl"]:+,.2f}\n'
                        f'Equity: {t["open"]:+,.2f} → {t["close"]:+,.2f}')
@@ -1232,6 +1300,21 @@ class App(tk.Tk):
                 c.create_text(xx(i),h-46,text=txt,fill=MUTED,font=('Segoe UI',9))
         net=sum(t['pnl'] for t in trades)
         c.create_text(w-right,h-16,anchor='e',text=f'{len(trades)} trades  •  Period P&L: {net:+,.2f}  •  Hover over chart for values',fill=TEXT)
+        # Animate plotted geometry from baseline, without disturbing the axes or labels.
+        c._draw_revision=getattr(c,'_draw_revision',0)+1
+        revision=c._draw_revision
+        item_ids=c.find_withtag('plot')
+        if c.winfo_ismapped() and item_ids:
+            baseline=h-75
+            originals={item:c.coords(item) for item in item_ids}
+            def reveal(step=0):
+                if not c.winfo_exists() or c._draw_revision!=revision:return
+                progress=1-(1-min(step,12)/12)**3
+                for item,coords in originals.items():
+                    new=[value if i%2==0 else baseline+(value-baseline)*progress for i,value in enumerate(coords)]
+                    c.coords(item,*new)
+                if step<12:c.after(19,reveal,step+1)
+            reveal()
 
     def chart_unhover(self, period):
         if period in self.period_canvases:
@@ -1346,8 +1429,8 @@ class App(tk.Tk):
                 button.grid(row=r, column=col, sticky='nsew', padx=3, pady=3, ipady=9)
 
     def _make_analytics(self):
-        outer = ttk.Frame(self.analytics_tab)
-        outer.pack(fill='both', expand=True, padx=18, pady=12)
+        outer = self._scroll_page(self.analytics_tab)
+        outer.configure(padding=(18,12))
         ttk.Label(outer, text='ADVANCED TRADING ANALYTICS', font=('Segoe UI Semibold', 18)).pack(anchor='w', pady=(0, 12))
         period_row = ttk.Frame(outer)
         period_row.pack(fill='x', pady=(0, 14))
@@ -1479,7 +1562,8 @@ class App(tk.Tk):
             'Best Streak':str(best), 'Worst Streak':str(worst),
             'Payoff Ratio':f'{avgwin/avgloss:.2f}' if avgloss and wins else '—'
         }
-        for key, label in self.analytics_labels.items(): label.config(text=report[key])
+        for key, label in self.analytics_labels.items():
+            label.config(text=report[key],fg=RED if report[key].startswith('-') else GREEN if report[key].startswith('+') else TEXT)
         # Include open trades in plan discipline, since compliance is a decision
         # about the entry, not a result of profit or loss.
         all_period_trades = []
@@ -1518,6 +1602,181 @@ class App(tk.Tk):
                 tree.insert('', 'end', values=(key,len(group),f'{100*sum(p>0 for p in group)/len(group):.1f}%',
                                                f'{sum(group):+,.2f}',f'{sum(group)/len(group):+,.2f}'))
 
+    def _delete_account(self):
+        with connect() as cn:
+            account=cn.execute('SELECT name FROM accounts WHERE id=?',(self.account_id,)).fetchone()
+            total=cn.execute('SELECT COUNT(*) FROM accounts').fetchone()[0]
+        if total<=1:return self.notify('Keep at least one account.', 'error')
+        if not account:return
+        if not messagebox.askyesno('Delete account',f"Delete {account['name']} and ALL its trades and screenshots?\nA backup will be created first."):
+            return
+        if not self._safety_backup_before_delete():return
+        with connect() as cn:
+            trade_ids=[r[0] for r in cn.execute('SELECT id FROM trades WHERE account_id=?',(self.account_id,))]
+            images=[r[0] for r in cn.execute('SELECT path FROM trade_images WHERE trade_id IN (SELECT id FROM trades WHERE account_id=?)',(self.account_id,))]
+            cn.execute('DELETE FROM trades WHERE account_id=?',(self.account_id,))
+            cn.execute('DELETE FROM accounts WHERE id=?',(self.account_id,))
+        for path in images:
+            target=Path(path)
+            if target.parent == IMAGES and target.exists():
+                try:target.unlink()
+                except OSError:pass
+        self._load_account_selection()
+        self._update_account_picker()
+        self._load_account_editor()
+        self.new_trade()
+        self.refresh()
+        self.notify('Account deleted and backup created.')
+
+    def _editing_locked(self):
+        # Funded accounts are locked on configured numeric-rule breach.
+        # on ordinary accounts a zero balance blocks the whole editor.
+        state=self._risk_state()
+        return bool(state['locked'] or (self._account_row() and not self._account_row()['funded'] and state['balance']<=0))
+
+    def _update_edit_access(self):
+        if not hasattr(self,'tabs') or not hasattr(self,'editor'):return
+        locked=self._editing_locked()
+        for name in ('header_new','header_save','editor_save_btn','editor_new_btn'):
+            widget=getattr(self,name,None)
+            if widget:
+                try:widget.configure(state='disabled' if locked else 'normal')
+                except tk.TclError:pass
+        try:self.tabs.tab(self.editor,state='disabled' if locked else 'normal')
+        except tk.TclError:pass
+        if locked:
+            try:
+                if self.tabs.select()==str(self.editor):self.tabs.select(self.history)
+            except tk.TclError:pass
+        return locked
+
+    def _cancel_editor(self):
+        self.trade_id=None
+        self.tabs.select(self.history)
+
+    def _make_trade_details(self):
+        top=ttk.Frame(self.detail_tab);top.pack(fill='x',padx=22,pady=12)
+        ttk.Label(top,text='TRADE DETAILS  /  READ ONLY',font=('Segoe UI Semibold',20)).pack(side='left')
+        ttk.Button(top,text='Back to History',command=lambda:self.tabs.select(self.history)).pack(side='right',padx=6)
+        self.details_edit=ttk.Button(top,text='✎  Edit Trade',style='Accent.TButton',command=self._edit_detail)
+        self.details_edit.pack(side='right',padx=6)
+        body=ttk.Frame(self.detail_tab);body.pack(fill='both',expand=True,padx=20,pady=10)
+        canvas=tk.Canvas(body,bg=BG,highlightthickness=0)
+        sb=ttk.Scrollbar(body,orient='vertical',command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side='right',fill='y');canvas.pack(side='left',fill='both',expand=True)
+        self.details_content=ttk.Frame(canvas)
+        wid=canvas.create_window((0,0),window=self.details_content,anchor='nw')
+        self.details_content.bind('<Configure>',lambda e:canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',lambda e:canvas.itemconfigure(wid,width=e.width))
+        canvas.bind('<MouseWheel>',lambda e:canvas.yview_scroll(-int(e.delta/120),'units'))
+        self.detail_trade_id=None
+
+    def view_selected(self):
+        ids=self.tree.selection()
+        if len(ids)!=1:return self.notify('Select exactly one trade to view.', 'error')
+        self.view_trade(int(ids[0]))
+
+    def view_trade(self, trade_id):
+        with connect() as cn:
+            row=cn.execute('SELECT * FROM trades WHERE id=? AND account_id=?',(trade_id,self.account_id)).fetchone()
+            images=cn.execute('SELECT slot,path FROM trade_images WHERE trade_id=?',(trade_id,)).fetchall()
+        if not row:return self.notify('Trade not found.','error')
+        self.detail_trade_id=trade_id
+        for widget in self.details_content.winfo_children():widget.destroy()
+        ttk.Label(self.details_content,text=f"Trade #{trade_id}   |   {row['symbol']}   |   {row['date']}",font=('Segoe UI Semibold',17)).pack(anchor='w',pady=(4,14))
+        for key in COLUMNS:
+            if key in ('setup','review'):continue
+            value=row[key]
+            frame=ttk.Frame(self.details_content);frame.pack(fill='x',pady=3)
+            ttk.Label(frame,text=key.replace('_',' ').title(),width=24).pack(side='left')
+            ttk.Label(frame,text=str(value) if value is not None else '—',foreground=GREEN if key=='pnl' and (value or 0)>0 else RED if key=='pnl' and (value or 0)<0 else TEXT).pack(side='left')
+        for key,title in (('setup','Entry rationale'),('review','Post-trade review / lessons')):
+            ttk.Label(self.details_content,text=title,font=('Segoe UI Semibold',13)).pack(anchor='w',pady=(14,4))
+            ttk.Label(self.details_content,text=row[key] or '—',wraplength=850,justify='left').pack(anchor='w')
+        ttk.Label(self.details_content,text='CHART SCREENSHOTS',font=('Segoe UI Semibold',13)).pack(anchor='w',pady=(16,6))
+        self._detail_img_refs=[]
+        for slot,path in images:
+            frame=ttk.Frame(self.details_content);frame.pack(fill='x',pady=6)
+            ttk.Label(frame,text=slot.replace('_',' / ').upper(),width=24).pack(side='left')
+            try:
+                im=Image.open(path);im.thumbnail((380,210))
+                photo=ImageTk.PhotoImage(im);self._detail_img_refs.append(photo)
+                label=ttk.Label(frame,image=photo);label.pack(side='left')
+            except (OSError,ValueError):ttk.Label(frame,text='Screenshot not available').pack(side='left')
+        self.details_edit.configure(state='disabled' if self._editing_locked() else 'normal')
+        self.tabs.select(self.detail_tab)
+
+    def _edit_detail(self):
+        if self._editing_locked():return self.notify('Account locked; edit unavailable.','error')
+        if self.detail_trade_id is not None:self.load_trade(self.detail_trade_id)
+
+    def _animate_visible_numbers(self):
+        if not hasattr(self,'tabs'):return
+        tab=self.tabs.select()
+        if tab not in (str(getattr(self,'dashboard',None)),str(getattr(self,'analytics_tab',None))):return
+        labels=(self.stats.values() if tab==str(self.dashboard) else self.analytics_labels.values())
+        for label in labels:
+            txt=label.cget('text')
+            match=__import__('re').match(r'^(\$?)([+-]?)([\d,]+(?:\.\d+)?)(%?)$',txt)
+            if not match:continue
+            prefix,sign,number,suffix=match.groups()
+            try:final=float(number.replace(',',''))*(-1 if sign=='-' else 1)
+            except ValueError:continue
+            self._animate_counter(label,final,prefix,suffix)
+
+    def _animate_counter(self,label,final,prefix='',suffix=''):
+        token=object();label._count_token=token
+        steps=12
+        for step in range(steps+1):
+            def tick(i=step):
+                if not label.winfo_exists() or getattr(label,'_count_token',None) is not token:return
+                val=final*(i/steps)
+                label.config(text=f'{prefix}{val:+,.2f}{suffix}' if final<0 else f'{prefix}{val:,.2f}{suffix}')
+                if final != 0:
+                    label.config(fg=RED if final<0 else GREEN)
+                if i==steps and final!=0:self._pulse_value_glow(label,final)
+            self.after(step*22,tick)
+
+    def _pulse_value_glow(self,label,value):
+        """Brief restrained colored luminosity pulse on positive/negative metrics."""
+        token=object();label._glow_token=token
+        base=RED if value<0 else GREEN
+        from tkinter import TclError
+        def pulse(step=0):
+            if not label.winfo_exists() or getattr(label,'_glow_token',None) is not token:return
+            # A high-contrast color pulse avoids unreadable oversaturated typography.
+            color=TEXT if step in (2,3) else base
+            try:label.configure(fg=color)
+            except TclError:return
+            if step<5:self.after(65,pulse,step+1)
+        pulse()
+
+    def _scroll_page(self, parent):
+        wrap=ttk.Frame(parent);wrap.pack(fill='both',expand=True)
+        canvas=tk.Canvas(wrap,bg=BG,highlightthickness=0)
+        bar=ttk.Scrollbar(wrap,orient='vertical',command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side='right',fill='y');canvas.pack(side='left',fill='both',expand=True)
+        body=ttk.Frame(canvas)
+        wid=canvas.create_window((0,0),window=body,anchor='nw')
+        body.bind('<Configure>',lambda e:canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',lambda e:canvas.itemconfigure(wid,width=e.width))
+        def wheel(event):
+            canvas.yview_scroll(-int(event.delta/120) if event.delta else (1 if event.num==5 else -1),'units')
+        # Routed only while this page is visible, preventing unrelated screens from scrolling.
+        canvas.bind('<MouseWheel>',wheel)
+        canvas.bind('<Button-4>',wheel);canvas.bind('<Button-5>',wheel)
+        def bind_children(widget):
+            for child in widget.winfo_children():
+                if not isinstance(child,(tk.Text,ttk.Combobox,ttk.Treeview)):
+                    child.bind('<MouseWheel>',wheel,add='+')
+                    child.bind('<Button-4>',wheel,add='+')
+                    child.bind('<Button-5>',wheel,add='+')
+                bind_children(child)
+        body.bind('<Configure>',lambda e:(canvas.configure(scrollregion=canvas.bbox('all')),bind_children(body)))
+        return body
+
     def _make_history(self):
         bar = ttk.Frame(self.history)
         bar.pack(fill='x', pady=10)
@@ -1541,7 +1800,7 @@ class App(tk.Tk):
         ttk.Button(bar, text='Delete Selected', command=self.delete_selected).pack(side='right', padx=5)
         ttk.Button(bar, text='Select All', command=self.select_all_trades).pack(side='right', padx=5)
         ttk.Button(bar, text='Clear Selection', command=self.clear_trade_selection).pack(side='right', padx=5)
-        ttk.Button(bar, text='Edit Selected', command=self.edit_selected).pack(side='right', padx=5)
+        ttk.Button(bar, text='View Trade', command=self.view_selected).pack(side='right', padx=5)
         cols = ('id','date','symbol','market','side','session','strategy','entry','exit','pnl','emotion','plan_followed','setup_grade')
         self.tree = ttk.Treeview(self.history, columns=cols, show='headings', selectmode='extended')
         sizes = dict(id=55, date=145, symbol=105, market=90, side=70, session=110, strategy=155, entry=95, exit=95, pnl=105, emotion=115, plan_followed=115, setup_grade=105)
@@ -1554,7 +1813,7 @@ class App(tk.Tk):
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side='left', fill='both', expand=True)
         sb.pack(side='right', fill='y')
-        self.tree.bind('<Double-1>', lambda e: self.edit_selected())
+        self.tree.bind('<Double-1>', lambda e: self.view_selected())
         self.history_selection_label = ttk.Label(bar, text='Ctrl+Click / Shift+Click to select multiple', style='Muted.TLabel')
         self.history_selection_label.pack(side='left', padx=9)
         self.tree.bind('<<TreeviewSelect>>', self.update_trade_selection_count)
@@ -1574,8 +1833,11 @@ class App(tk.Tk):
         self.editor_title.pack(anchor='w', pady=(0, 8))
         fixed_actions = ttk.Frame(action_bar)
         fixed_actions.pack(fill='x')
-        ttk.Button(fixed_actions, text='Save Trade', style='Accent.TButton', command=self.save_trade).pack(side='left', padx=3)
-        ttk.Button(fixed_actions, text='+ New Trade', command=self.new_trade).pack(side='left', padx=3)
+        self.editor_save_btn = ttk.Button(fixed_actions, text='Save Trade', style='Accent.TButton', command=self.save_trade)
+        self.editor_save_btn.pack(side='left', padx=3)
+        self.editor_new_btn = ttk.Button(fixed_actions, text='+ New Trade', command=self.new_trade)
+        self.editor_new_btn.pack(side='left', padx=3)
+        ttk.Button(fixed_actions,text='Cancel',command=self._cancel_editor).pack(side='left',padx=3)
 
         scroll_container = ttk.Frame(left)
         scroll_container.pack(fill='both', expand=True)
@@ -1706,6 +1968,7 @@ class App(tk.Tk):
         for name, val in stats.items():
             self.stats[name].config(text=val,fg=RED if name=='Net P&L' and sum(pnls)<0 else GREEN if name=='Net P&L' and sum(pnls)>0 else TEXT)
         if hasattr(self,'risk_bars'): self._render_risk_bars()
+        self._update_edit_access()
         if hasattr(self,'period_canvases'):
             for p in self.period_canvases:self.draw_period(p)
 
@@ -1733,6 +1996,9 @@ class App(tk.Tk):
         self.load_history()
 
     def new_trade(self):
+        if self._editing_locked():
+            self._update_edit_access()
+            return self.notify('Account balance or risk limit locks new trades.','error')
         self.trade_id=None
         self.pending_images={}
         for v in self.fields.values():v.set('')
@@ -1747,12 +2013,13 @@ class App(tk.Tk):
         self.editor_title.config(text='New Trade')
         self.refresh_images()
         self.tabs.select(self.editor)
+        self._update_edit_access()
 
     def edit_selected(self):
         items=self.tree.selection()
         if not items:return self.notify('Select a trade first.', 'error')
         if len(items)>1:return self.notify('Select only one trade for editing.', 'error')
-        self.load_trade(int(items[0]))
+        self.view_trade(int(items[0]))
 
     def load_trade(self,trade_id):
         with connect() as cn:
@@ -1769,8 +2036,12 @@ class App(tk.Tk):
         self.editor_title.config(text=f'Editing Trade #{trade_id}')
         self.refresh_images()
         self.tabs.select(self.editor)
+        self._update_edit_access()
 
     def save_trade(self):
+        was_new=self.trade_id is None
+        if self._editing_locked():
+            return self.notify('Account locked: no new trades or edits are permitted.', 'error')
         values={k:v.get().strip() for k,v in self.fields.items()}
         values['emotion'] = plain_emotion(values['emotion'])
         if values['setup_grade'] not in ('A+','A','B','C','Not Graded'):
@@ -1823,8 +2094,12 @@ class App(tk.Tk):
             if p not in used and Path(p).parent==IMAGES and Path(p).exists():
                 try:Path(p).unlink()
                 except OSError:pass
-        self.load_trade(tid)
         self.refresh()
+        # A successful Add clears the form immediately; edits return to read-only details.
+        if was_new:
+            self.new_trade()
+        else:
+            self.view_trade(tid)
         self.notify(f'Trade #{tid} saved successfully  •  Stored locally')
 
     def update_trade_selection_count(self, event=None):
