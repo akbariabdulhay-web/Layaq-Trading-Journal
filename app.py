@@ -2671,5 +2671,616 @@ class App(tk.Tk):
         finally:
             shutil.rmtree(staging,ignore_errors=True)
 
+# === LAYAQ TRADING JOURNAL V3 UPGRADE ===
+
+def install_layaq_v3():
+    import json as _json
+    import datetime as _dt
+    import tkinter as _tk
+    from tkinter import ttk as _ttk
+
+    previous_setup = setup
+
+    def new_setup():
+        previous_setup()
+        with connect() as cn:
+            cn.execute("""
+                CREATE TABLE IF NOT EXISTS recycle_bin (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL
+                )
+            """)
+
+    globals()["setup"] = new_setup
+
+    original_init = App.__init__
+    original_layout = App._layout
+
+    # WINDOWS RESIZE AND TASKBAR
+    def improved_init(self):
+        original_init(self)
+
+        self.overrideredirect(False)
+        self.resizable(True, True)
+        self.minsize(760, 520)
+
+        self.bind(
+            "<Configure>",
+            lambda e: self._v3_resize(e),
+            add="+"
+        )
+
+        self.bind(
+            "<Control-n>",
+            lambda e: self.new_trade()
+            if hasattr(self, "tabs") else None
+        )
+        self.bind(
+            "<Control-s>",
+            lambda e: self.save_trade()
+            if hasattr(self, "tabs") else None
+        )
+        self.bind(
+            "<Control-e>",
+            lambda e: self.export_csv()
+            if hasattr(self, "tabs") else None
+        )
+
+    def improved_layout(self):
+        original_layout(self)
+
+        _ttk.Button(
+            self.chrome,
+            text="Recycle Bin",
+            command=self._v3_bin
+        ).pack(side="right", padx=(3, 7), pady=4)
+
+        _ttk.Button(
+            self._navigation_host,
+            text="Add / Edit Trade",
+            command=lambda: self.tabs.select(self.editor)
+        ).pack(fill="x", padx=12, pady=3)
+
+        _ttk.Button(
+            self._navigation_host,
+            text="Trade Details",
+            command=lambda: self.tabs.select(self.detail_tab)
+        ).pack(fill="x", padx=12, pady=3)
+
+        header = self.header_save.master
+        children = header.winfo_children()
+
+        self._v3_heading = next(
+            (
+                w for w in children
+                if isinstance(w, _tk.Label)
+                and "LAYAQ  /  TRADING" in w.cget("text")
+            ),
+            None
+        )
+
+        self._v3_subheading = next(
+            (
+                w for w in children
+                if isinstance(w, _tk.Label)
+                and "NEON EDITION" in w.cget("text")
+            ),
+            None
+        )
+
+        self.after_idle(self._v3_resize)
+
+    def resize(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+
+        if not hasattr(self, "sidebar"):
+            return
+
+        narrow = self.winfo_width() < 1050
+
+        self.sidebar.configure(
+            width=155 if narrow else 228
+        )
+
+        if hasattr(self, "account_picker"):
+            self.account_picker.configure(
+                width=13 if narrow else 24
+            )
+
+        if self._v3_heading is not None:
+            self._v3_heading.configure(
+                text="LAYAQ" if narrow
+                else "LAYAQ  /  TRADING JOURNAL SUPER APP"
+            )
+
+        if self._v3_subheading is not None:
+            self._v3_subheading.configure(
+                text="" if narrow
+                else "NEON EDITION   •   OFFLINE"
+            )
+
+    def minimize(self):
+        self.iconify()
+
+    # DATABASE HELPERS
+    def insert_record(cn, table, values):
+        if table not in (
+            "accounts",
+            "trades",
+            "trade_images"
+        ):
+            raise ValueError("Invalid table")
+
+        columns = list(values)
+
+        quoted = ",".join(
+            '"' + col.replace('"', '""') + '"'
+            for col in columns
+        )
+
+        placeholders = ",".join(
+            "?" for _ in columns
+        )
+
+        return cn.execute(
+            f"INSERT INTO {table} ({quoted}) "
+            f"VALUES ({placeholders})",
+            [values[col] for col in columns]
+        ).lastrowid
+
+    # SOFT DELETE ACCOUNT
+    def move_account(self):
+        with connect() as cn:
+            account = cn.execute(
+                "SELECT * FROM accounts WHERE id=?",
+                (self.account_id,)
+            ).fetchone()
+
+            total = cn.execute(
+                "SELECT COUNT(*) FROM accounts"
+            ).fetchone()[0]
+
+        if total <= 1:
+            return self.notify(
+                "Keep at least one active account.",
+                "error"
+            )
+
+        if account is None:
+            return
+
+        confirmed = messagebox.askyesno(
+            "Recycle Account",
+            f"Move {account['name']} and its trades "
+            "to Recycle Bin?"
+        )
+
+        if not confirmed:
+            return
+
+        try:
+            self._safety_backup_before_delete()
+
+            with connect() as cn:
+                account = dict(
+                    cn.execute(
+                        "SELECT * FROM accounts WHERE id=?",
+                        (self.account_id,)
+                    ).fetchone()
+                )
+
+                trades = [
+                    dict(r) for r in cn.execute(
+                        "SELECT * FROM trades "
+                        "WHERE account_id=?",
+                        (self.account_id,)
+                    )
+                ]
+
+                images = [
+                    dict(r) for r in cn.execute(
+                        """
+                        SELECT i.*
+                        FROM trade_images i
+                        JOIN trades t ON t.id=i.trade_id
+                        WHERE t.account_id=?
+                        """,
+                        (self.account_id,)
+                    )
+                ]
+
+                payload = {
+                    "account": account,
+                    "trades": trades,
+                    "images": images
+                }
+
+                cn.execute(
+                    """
+                    INSERT INTO recycle_bin
+                    (kind,title,payload,deleted_at)
+                    VALUES (?,?,?,?)
+                    """,
+                    (
+                        "account",
+                        account["name"],
+                        _json.dumps(payload),
+                        _dt.datetime.now().isoformat()
+                    )
+                )
+
+                cn.execute(
+                    "DELETE FROM trades WHERE account_id=?",
+                    (self.account_id,)
+                )
+
+                cn.execute(
+                    "DELETE FROM accounts WHERE id=?",
+                    (self.account_id,)
+                )
+
+            self._load_account_selection()
+            self._update_account_picker()
+            self._load_account_editor()
+            self.new_trade()
+            self.refresh()
+
+            self.notify(
+                "Account moved to Recycle Bin."
+            )
+
+        except Exception as exc:
+            self.notify(
+                f"Recycle failed: {exc}",
+                "error",
+                8000
+            )
+
+    # SOFT DELETE TRADES
+    def move_trades(self, ids):
+        ids = sorted(set(int(x) for x in ids))
+
+        if not ids:
+            return
+
+        try:
+            self._safety_backup_before_delete()
+
+            with connect() as cn:
+                marks = ",".join("?" for _ in ids)
+
+                rows = [
+                    dict(r) for r in cn.execute(
+                        f"SELECT * FROM trades "
+                        f"WHERE id IN ({marks}) "
+                        "AND account_id=?",
+                        ids + [self.account_id]
+                    )
+                ]
+
+                if not rows:
+                    return
+
+                found = [r["id"] for r in rows]
+                marks = ",".join("?" for _ in found)
+
+                images = [
+                    dict(r) for r in cn.execute(
+                        f"SELECT * FROM trade_images "
+                        f"WHERE trade_id IN ({marks})",
+                        found
+                    )
+                ]
+
+                payload = {
+                    "account_id": self.account_id,
+                    "trades": rows,
+                    "images": images
+                }
+
+                cn.execute(
+                    """
+                    INSERT INTO recycle_bin
+                    (kind,title,payload,deleted_at)
+                    VALUES (?,?,?,?)
+                    """,
+                    (
+                        "trades",
+                        f"{len(rows)} trades",
+                        _json.dumps(payload),
+                        _dt.datetime.now().isoformat()
+                    )
+                )
+
+                cn.execute(
+                    f"DELETE FROM trades "
+                    f"WHERE id IN ({marks}) "
+                    "AND account_id=?",
+                    found + [self.account_id]
+                )
+
+            if self.trade_id in found:
+                self.new_trade()
+
+            self.refresh()
+
+            self.notify(
+                f"{len(rows)} trade(s) moved to Recycle Bin."
+            )
+
+        except Exception as exc:
+            self.notify(
+                f"Recycle failed: {exc}",
+                "error",
+                8000
+            )
+
+    # RECYCLE BIN INTERFACE
+    def show_bin(self):
+        overlay, body, _ = self._overlay_shell(
+            "RECYCLE BIN"
+        )
+
+        _tk.Label(
+            body,
+            bg=PANEL,
+            fg=TEXT,
+            text="Select an item to restore or erase."
+        ).pack(anchor="w", pady=8)
+
+        listing = _tk.Listbox(
+            body,
+            height=12,
+            width=65,
+            bg=ENTRY,
+            fg=TEXT,
+            selectbackground=ACCENT,
+            selectforeground=BG
+        )
+
+        listing.pack(
+            fill="both",
+            expand=True
+        )
+
+        records = []
+
+        def reload_items():
+            records.clear()
+            listing.delete(0, "end")
+
+            with connect() as cn:
+                records.extend(
+                    dict(r) for r in cn.execute(
+                        """
+                        SELECT id,kind,title,deleted_at
+                        FROM recycle_bin
+                        ORDER BY id DESC
+                        """
+                    )
+                )
+
+            for rec in records:
+                listing.insert(
+                    "end",
+                    f"{rec['deleted_at'][:19]} | "
+                    f"{rec['kind']} | {rec['title']}"
+                )
+
+        def selected():
+            indexes = listing.curselection()
+            return (
+                records[indexes[0]]
+                if indexes else None
+            )
+
+        # RESTORE ACCOUNT OR TRADES
+        def restore():
+            rec = selected()
+
+            if rec is None:
+                return self.notify(
+                    "Select an item first.",
+                    "error"
+                )
+
+            try:
+                with connect() as cn:
+                    record = cn.execute(
+                        "SELECT * FROM recycle_bin "
+                        "WHERE id=?",
+                        (rec["id"],)
+                    ).fetchone()
+
+                    if record is None:
+                        return
+
+                    payload = _json.loads(
+                        record["payload"]
+                    )
+
+                    if record["kind"] == "account":
+                        account = dict(
+                            payload["account"]
+                        )
+
+                        exists = cn.execute(
+                            "SELECT 1 FROM accounts "
+                            "WHERE id=?",
+                            (account["id"],)
+                        ).fetchone()
+
+                        if exists:
+                            account.pop("id")
+
+                        name_exists = cn.execute(
+                            "SELECT 1 FROM accounts "
+                            "WHERE name=?",
+                            (account["name"],)
+                        ).fetchone()
+
+                        if name_exists:
+                            account["name"] += (
+                                " (Restored "
+                                + str(record["id"])
+                                + ")"
+                            )
+
+                        account_id = insert_record(
+                            cn,
+                            "accounts",
+                            account
+                        )
+
+                    else:
+                        account_id = payload[
+                            "account_id"
+                        ]
+
+                        exists = cn.execute(
+                            "SELECT 1 FROM accounts "
+                            "WHERE id=?",
+                            (account_id,)
+                        ).fetchone()
+
+                        if not exists:
+                            raise ValueError(
+                                "Restore the original "
+                                "account first."
+                            )
+
+                    id_map = {}
+
+                    for original in payload["trades"]:
+                        row = dict(original)
+                        old_id = row["id"]
+
+                        row["account_id"] = account_id
+
+                        exists = cn.execute(
+                            "SELECT 1 FROM trades "
+                            "WHERE id=?",
+                            (old_id,)
+                        ).fetchone()
+
+                        if exists:
+                            row.pop("id")
+
+                        id_map[old_id] = insert_record(
+                            cn,
+                            "trades",
+                            row
+                        )
+
+                    for original in payload["images"]:
+                        row = dict(original)
+
+                        row["trade_id"] = id_map[
+                            row["trade_id"]
+                        ]
+
+                        insert_record(
+                            cn,
+                            "trade_images",
+                            row
+                        )
+
+                    cn.execute(
+                        "DELETE FROM recycle_bin "
+                        "WHERE id=?",
+                        (rec["id"],)
+                    )
+
+                self._update_account_picker()
+                self.refresh()
+                reload_items()
+
+                self.notify(
+                    "Restored successfully."
+                )
+
+            except Exception as exc:
+                self.notify(
+                    f"Restore failed: {exc}",
+                    "error",
+                    8000
+                )
+
+        # PERMANENT DELETE
+        def erase():
+            rec = selected()
+
+            if rec is None:
+                return self.notify(
+                    "Select an item first.",
+                    "error"
+                )
+
+            confirmed = messagebox.askyesno(
+                "Permanent Deletion",
+                "Erase this Recycle Bin record "
+                "permanently? This cannot be undone."
+            )
+
+            if not confirmed:
+                return
+
+            with connect() as cn:
+                cn.execute(
+                    "DELETE FROM recycle_bin WHERE id=?",
+                    (rec["id"],)
+                )
+
+            reload_items()
+
+            self.notify(
+                "Recycle Bin record erased."
+            )
+
+        buttons = _tk.Frame(
+            body,
+            bg=PANEL
+        )
+
+        buttons.pack(fill="x", pady=10)
+
+        _ttk.Button(
+            buttons,
+            text="Restore",
+            command=restore
+        ).pack(side="left", padx=4)
+
+        _ttk.Button(
+            buttons,
+            text="Delete Permanently",
+            command=erase
+        ).pack(side="left", padx=4)
+
+        _ttk.Button(
+            buttons,
+            text="Close",
+            command=overlay.destroy
+        ).pack(side="right", padx=4)
+
+        reload_items()
+
+    # ACTIVATE NEW FUNCTIONS
+    App.__init__ = improved_init
+    App._layout = improved_layout
+    App._v3_resize = resize
+    App._minimize = minimize
+    App._delete_account = move_account
+    App._delete_trades = move_trades
+    App._v3_bin = show_bin
+
+
+install_layaq_v3()
+
+# === END LAYAQ TRADING JOURNAL V3 UPGRADE ===
+
 if __name__=='__main__':
     App().mainloop()
